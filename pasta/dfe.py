@@ -52,7 +52,7 @@ DFE_TYPES_MAP = {
 
 TIPO_SOLICITACAO = "1"  # 1=PERIODO
 
-MAX_TENTATIVAS = 3
+MAX_TENTATIVAS = 5
 DELAY_ENTRE_TENTATIVAS = 10  # seg
 
 # intervalo entre varreduras no Render (ex.: 3600 = 1h)
@@ -465,9 +465,13 @@ def enviar_solicitacao_sequencial(s: requests.Session):
 
 
 # =========================================================
-# PARTE 2 — LISTAR SOLICITAÇÕES E BAIXAR (MÊS ANTERIOR)
+# PARTE 2 — LISTAR TODAS AS SOLICITAÇÕES (COM ESTADO)
 # =========================================================
-def encontrar_downloads_prontos(s: requests.Session) -> List[Dict[str, str]]:
+def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
+    """
+    Lista TODAS as solicitações (independente de estado),
+    para depois filtrar por período e estado no fluxo.
+    """
     print("🔎 Acessando lista de solicitações...")
     r = s.get(URL_SOLICITACOES, timeout=30)
     if r.status_code != 200:
@@ -491,8 +495,7 @@ def encontrar_downloads_prontos(s: requests.Session) -> List[Dict[str, str]]:
         print("❌ Cabeçalhos esperados não encontrados (DATA, DOCUMENTO, ESTADO, AÇÕES).")
         return []
 
-    data_mes_atual = get_current_month_str()
-    prontos: List[Dict[str, str]] = []
+    itens: List[Dict[str, str]] = []
 
     rows = tabela.find("tbody").find_all("tr") if tabela.find("tbody") else tabela.find_all("tr")[1:]
 
@@ -505,9 +508,6 @@ def encontrar_downloads_prontos(s: requests.Session) -> List[Dict[str, str]]:
         tipo_documento = cols[idx_doc].text.strip()
         estado = cols[idx_status].text.strip().upper()
 
-        match_mes_ano = re.search(r"(\d{2}/\d{4})", data_full)
-        data_mes_ano = match_mes_ano.group(1) if match_mes_ano else None
-
         detalhe_link = cols[idx_acoes].find("a", href=re.compile(r"/solicitacoes/detalhes/(\d+)"))
         solicitacao_id = None
         if detalhe_link and detalhe_link.has_attr("href"):
@@ -515,17 +515,17 @@ def encontrar_downloads_prontos(s: requests.Session) -> List[Dict[str, str]]:
             if m:
                 solicitacao_id = m.group(1)
 
-        if data_mes_ano == data_mes_atual and estado == "DOWNLOAD" and solicitacao_id:
-            print(f"➡️ Encontrada solicitação em DOWNLOAD: ID {solicitacao_id} | {tipo_documento} | {data_full}")
-            prontos.append({
+        if solicitacao_id:
+            itens.append({
                 "id": solicitacao_id,
                 "documento": tipo_documento,
+                "estado": estado,
+                "data": data_full,
                 "file_name": f"{tipo_documento}_{solicitacao_id}.zip".replace(" ", "_").replace("/", "-"),
             })
 
-    if not prontos:
-        print("⚠️ Nenhuma solicitação do mês atual em DOWNLOAD.")
-    return prontos
+    print(f"   ✔ {len(itens)} solicitações encontradas na tabela.")
+    return itens
 
 
 def obter_periodo_da_solicitacao(s: requests.Session, solicitacao_id: str) -> Optional[str]:
@@ -552,7 +552,7 @@ def obter_periodo_da_solicitacao(s: requests.Session, solicitacao_id: str) -> Op
     if not periodo:
         print(f"   ⚠️ Não foi possível identificar o período para a solicitação {solicitacao_id}.")
     else:
-        print(f"   ✔ Período extraído: {periodo}")
+        print(f"   ✔ Período extraído ({solicitacao_id}): {periodo}")
     return periodo
 
 
@@ -685,7 +685,7 @@ def realizar_download_dfe(
 
 
 # =========================================================
-# FLUXO POR EMPRESA (CERTIFICADO)
+# FLUXO POR EMPRESA (CERTIFICADO) — AJUSTADO
 # =========================================================
 def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
@@ -705,61 +705,79 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         print("❌ Erro ao criar sessão com certificado:", e)
         return
 
-    print("\n--- INICIANDO VERIFICAÇÃO / DOWNLOAD DE SOLICITAÇÕES ---")
-    solicitacoes = encontrar_downloads_prontos(s)
+    print("\n--- INICIANDO VERIFICAÇÃO / SOLICITAÇÕES / DOWNLOADS ---")
+    solicitacoes = listar_solicitacoes(s)
 
     periodo_mes_ant = periodo_mes_anterior_str()
     mes_cod = mes_anterior_codigo()
-    baixou_algum = False
+
+    existe_solicitacao_mes_anterior = False
 
     if solicitacoes:
         for item in solicitacoes:
-            periodo = obter_periodo_da_solicitacao(s, item["id"])
+            solicitacao_id = item["id"]
+            estado = item.get("estado", "").upper()
+
+            periodo = obter_periodo_da_solicitacao(s, solicitacao_id)
             if not periodo:
-                print(f"   ⛔ Período não identificado para ID {item['id']}. Ignorando.")
+                print(f"   ⛔ Período não identificado para ID {solicitacao_id}. Ignorando.")
                 continue
 
-            if periodo.strip() == periodo_mes_ant:
-                print(f"✔ Período confere (mês anterior) → avaliando download ID {item['id']}")
+            periodo_ok = (periodo.strip() == periodo_mes_ant)
 
-                base_name = item["file_name"]   # ex: NFE_17448627.zip
-                nome_final = montar_nome_final_arquivo(
-                    base_name=base_name,
-                    empresa=empresa,
-                    user=user,
-                    codi=codi,
-                    mes_cod=mes_cod,
-                    doc=doc,
-                )
-                storage_path = f"{PASTA_NOTAS}/{nome_final}"  # notas/<arquivo.zip>
+            if periodo_ok:
+                existe_solicitacao_mes_anterior = True
+                print(f"✔ Solicitação {solicitacao_id} é do MÊS ANTERIOR | estado: {estado}")
 
-                if arquivo_ja_existe_no_storage(storage_path):
-                    print(f"   ⤵ Já existe no Supabase, não será baixado novamente: {storage_path}")
-                    baixou_algum = True
-                    continue
+                # Se já está em DOWNLOAD → tentar baixar
+                if estado == "DOWNLOAD":
+                    base_name = item["file_name"]   # ex: NFE_17448627.zip
+                    nome_final = montar_nome_final_arquivo(
+                        base_name=base_name,
+                        empresa=empresa,
+                        user=user,
+                        codi=codi,
+                        mes_cod=mes_cod,
+                        doc=doc,
+                    )
+                    storage_path = f"{PASTA_NOTAS}/{nome_final}"  # notas/<arquivo.zip>
 
-                ok = False
-                tent = 0
-                while tent < 3 and not ok:
-                    ok = realizar_download_dfe(s, item, storage_path)
-                    tent += 1
-                    if not ok:
-                        print(f"   Tentativa {tent} falhou para ID {item['id']}.")
-                        time.sleep(10)
+                    if arquivo_ja_existe_no_storage(storage_path):
+                        print(f"   ⤵ Já existe no Supabase, não será baixado novamente: {storage_path}")
+                        continue
 
-                if ok:
-                    baixou_algum = True
+                    ok = False
+                    tent = 0
+                    while tent < 3 and not ok:
+                        ok = realizar_download_dfe(s, item, storage_path)
+                        tent += 1
+                        if not ok:
+                            print(f"   Tentativa {tent} falhou para ID {solicitacao_id}.")
+                            time.sleep(10)
+
+                    if ok:
+                        print(f"   ✅ Download concluído para ID {solicitacao_id}.")
+                    else:
+                        print(f"❌ Falha crítica ao baixar ID {solicitacao_id} depois de 3 tentativas.")
                 else:
-                    print(f"❌ Falha crítica ao baixar ID {item['id']} depois de 3 tentativas.")
+                    # Exemplo de estados: PROCESSANDO, GERANDO ARQUIVO(S), etc.
+                    print(f"   🔄 Solicitação {solicitacao_id} do mês anterior ainda está em estado '{estado}'. Aguardando próxima varredura.")
             else:
-                print(f"   ⛔ Período {periodo} não confere com mês anterior ({periodo_mes_ant}). Ignorando ID {item['id']}.")
+                print(f"   ⛔ Solicitação {solicitacao_id} tem período {periodo}, diferente do mês anterior ({periodo_mes_ant}). Ignorando.")
 
-    if not baixou_algum:
-        print("\n⚠️ Nenhuma solicitação do mês atual em DOWNLOAD com período do mês anterior.")
+        # Decisão de abrir ou não novas solicitações
+        if existe_solicitacao_mes_anterior:
+            print("\n✅ Já existe pelo menos uma solicitação para o MÊS ANTERIOR (em qualquer estado).")
+            print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
+        else:
+            print("\n⚠️ NÃO existe nenhuma solicitação com PERÍODO do mês anterior.")
+            print("➡️ Abrindo novas solicitações para o mês anterior...")
+            enviar_solicitacao_sequencial(s)
+
+    else:
+        print("\n⚠️ Nenhuma solicitação encontrada na lista.")
         print("➡️ Abrindo novas solicitações para o mês anterior...")
         enviar_solicitacao_sequencial(s)
-    else:
-        print("\n✅ Pelo menos um arquivo foi tratado (download/skip). Não será aberta nova solicitação.")
 
 
 # =========================================================
