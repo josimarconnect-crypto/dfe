@@ -5,8 +5,9 @@ import os
 import base64
 import tempfile
 from bs4 import BeautifulSoup
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from typing import Dict, Any, Optional, List, Tuple
+from zoneinfo import ZoneInfo  # 👈 Fuso horário
 
 # =========================================================
 # === CONFIGURAÇÕES SUPABASE (via REST) ===================
@@ -58,6 +59,18 @@ DELAY_ENTRE_TENTATIVAS = 10  # seg
 # intervalo entre varreduras no Render (ex.: 3600 = 1h)
 INTERVALO_LOOP_SEGUNDOS = 3600
 
+# =========================================================
+# FUSO HORÁRIO (RONDÔNIA)
+# =========================================================
+FUSO_RO = ZoneInfo("America/Porto_Velho")
+
+def hoje_ro() -> date:
+    """
+    Retorna a data de hoje considerando o fuso de Rondônia (America/Porto_Velho),
+    independentemente do fuso do servidor (ex.: UTC no Render).
+    """
+    return datetime.now(FUSO_RO).date()
+
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -79,8 +92,8 @@ def somente_numeros(s: Optional[str]) -> str:
 
 
 def mes_anterior_codigo() -> str:
-    """Retorna código AAAAMM do mês anterior."""
-    hoje = date.today()
+    """Retorna código AAAAMM do mês anterior (baseado no fuso de Rondônia)."""
+    hoje = hoje_ro()
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
     return fim_mes_anterior.strftime("%Y%m")
@@ -227,12 +240,13 @@ def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
 
 
 def get_current_month_str() -> str:
-    return date.today().strftime("%m/%Y")
+    """Retorna o mês/ano atual (MM/YYYY) considerando o fuso de Rondônia."""
+    return hoje_ro().strftime("%m/%Y")
 
 
 def mes_anterior() -> Tuple[str, str]:
-    """Datas do mês anterior no formato DD/MM/YYYY."""
-    hoje = date.today()
+    """Datas do mês anterior no formato DD/MM/YYYY (baseado no fuso de Rondônia)."""
+    hoje = hoje_ro()
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
     inicio_mes_anterior = fim_mes_anterior.replace(day=1)
@@ -244,7 +258,7 @@ def mes_anterior() -> Tuple[str, str]:
 
 
 def periodo_mes_anterior_str() -> str:
-    """Retorna 'DD/MM/YYYY a DD/MM/YYYY' do mês anterior."""
+    """Retorna 'DD/MM/YYYY a DD/MM/YYYY' do mês anterior (fuso de Rondônia)."""
     ini, fim = mes_anterior()
     return f"{ini} a {fim}"
 
@@ -799,9 +813,10 @@ def processar_todas_empresas():
 if __name__ == "__main__":
     while True:
         print("\n\n==================== NOVA VARREDURA GERAL ====================")
+        print(f"📅 Data (fuso RO): {hoje_ro().strftime('%d/%m/%Y')}")
         try:
             processar_todas_empresas()
         except Exception as e:
             print(f"💥 Erro inesperado no loop principal: {e}")
-        print(f"🕒 Aguardando {INTERVALO_LOOP_SEGUNDOS} segundos para próxima varredura...")
+        print(f"🕒 Aguardando {INTERVALO_LOOP_SEGUNDOS} segundos para próxima varredura...\n")
         time.sleep(INTERVALO_LOOP_SEGUNDOS)
