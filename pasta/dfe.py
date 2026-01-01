@@ -54,10 +54,10 @@ DFE_TYPES_MAP = {
 TIPO_SOLICITACAO = "1"  # 1=PERIODO
 
 MAX_TENTATIVAS = 5
-DELAY_ENTRE_TENTATIVAS = 10  # seg
+DELAY_ENTRE_TENTATIVAS = 2  # seg
 
-# intervalo entre varreduras no Render (ex.: 3600 = 1h)
-INTERVALO_LOOP_SEGUNDOS = 3600
+# intervalo entre varreduras no Render (ex.: 36 )
+INTERVALO_LOOP_SEGUNDOS = 36
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
