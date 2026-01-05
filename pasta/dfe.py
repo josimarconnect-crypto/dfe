@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import requests
 import time
 import re
@@ -8,6 +9,7 @@ from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo  # 👈 Fuso horário
+from urllib.parse import quote  # ✅ URL-encode do path (corrige 400 no HEAD/POST)
 
 # =========================================================
 # === CONFIGURAÇÕES SUPABASE (via REST) ===================
@@ -18,7 +20,6 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 TABELA_CERTS = "certifica_dfe"
 BUCKET_IMAGENS = "imagens"
 PASTA_NOTAS = "notas"  # subpasta dentro do bucket
-
 
 def supabase_headers(is_json: bool = False) -> Dict[str, str]:
     h = {
@@ -38,12 +39,12 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 ANTI_CAPTCHA_KEY = "60ce5191cf427863d4f3c79ee20e4afe"
 
 # URLs gerais
-URL_HOME = "https://dfe.sefin.ro.gov.br/"
-URL_BASE = "https://download.dfe.sefin.ro.gov.br"
-URL_NOVO = URL_BASE + "/solicitacoes/novo"
-URL_SOLICITACOES = URL_BASE + "/solicitacoes"
-URL_DETALHES_TEMPLATE = URL_BASE + "/solicitacoes/detalhes/{id}"
-URL_CREATE_BASE = URL_BASE
+URL_HOME  = "https://dfe.sefin.ro.gov.br/"
+URL_BASE  = "https://download.dfe.sefin.ro.gov.br"
+URL_NOVO  = URL_BASE + "/solicitacoes/novo"
+URL_SOLICITACOES       = URL_BASE + "/solicitacoes"
+URL_DETALHES_TEMPLATE  = URL_BASE + "/solicitacoes/detalhes/{id}"
+URL_CREATE_BASE        = URL_BASE
 
 # Tipos DFe
 DFE_TYPES_MAP = {
@@ -57,14 +58,14 @@ TIPO_SOLICITACAO = "1"  # 1=PERIODO
 MAX_TENTATIVAS = 5
 DELAY_ENTRE_TENTATIVAS = 2  # seg
 
-# intervalo entre varreduras no Render (ex.: 36 )
+# intervalo entre varreduras (ex.: 36)
 INTERVALO_LOOP_SEGUNDOS = 36
+
 
 # =========================================================
 # FUSO HORÁRIO (RONDÔNIA)
 # =========================================================
 FUSO_RO = ZoneInfo("America/Porto_Velho")
-
 
 def hoje_ro() -> date:
     """
@@ -86,12 +87,10 @@ def slugify(valor: str) -> str:
     s = s.strip("-")
     return s or "sem-nome"
 
-
 def somente_numeros(s: Optional[str]) -> str:
     if not s:
         return ""
     return re.sub(r"\D+", "", s)
-
 
 def mes_anterior_codigo() -> str:
     """Retorna código AAAAMM do mês anterior (baseado no fuso de Rondônia)."""
@@ -100,6 +99,21 @@ def mes_anterior_codigo() -> str:
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
     return fim_mes_anterior.strftime("%Y%m")
 
+def mes_anterior() -> Tuple[str, str]:
+    """Datas do mês anterior no formato DD/MM/YYYY (baseado no fuso de Rondônia)."""
+    hoje = hoje_ro()
+    inicio_mes_atual = hoje.replace(day=1)
+    fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
+    inicio_mes_anterior = fim_mes_anterior.replace(day=1)
+    return (
+        inicio_mes_anterior.strftime("%d/%m/%Y"),
+        fim_mes_anterior.strftime("%d/%m/%Y"),
+    )
+
+def periodo_mes_anterior_str() -> str:
+    """Retorna 'DD/MM/YYYY a DD/MM/YYYY' do mês anterior (fuso de Rondônia)."""
+    ini, fim = mes_anterior()
+    return f"{ini} a {fim}"
 
 def normalizar_tipo_documento(texto: str) -> Optional[str]:
     """
@@ -109,22 +123,21 @@ def normalizar_tipo_documento(texto: str) -> Optional[str]:
     if not texto:
         return None
     t = texto.strip().upper()
-
-    # remove espaços duplicados
     t = re.sub(r"\s+", " ", t)
 
-    # casos comuns
-    if "CT" in t and "E" in t and ("CTE" in t or "CT-E" in t or "CT E" in t or "CONHECIMENTO" in t):
+    # CTe
+    if "CTE" in t or "CT-E" in t or "CONHECIMENTO" in t:
         return "CTe"
-    if "NFC" in t and ("NFCE" in t or "NFC-E" in t or "NFC E" in t or "CONSUMIDOR" in t):
+    # NFCe
+    if "NFCE" in t or "NFC-E" in t or "CONSUMIDOR" in t:
         return "NFCe"
-    if "NF" in t and ("NFE" in t or "NF-E" in t or "NF E" in t or "NOTA FISCAL" in t):
-        # cuidado: não confundir NFCe
+    # NFe (cuidado com NFCe)
+    if "NFE" in t or "NF-E" in t or "NOTA FISCAL" in t:
         if "NFC" in t:
             return "NFCe"
         return "NFe"
 
-    # fallback por substring
+    # fallbacks
     if "CTE" in t:
         return "CTe"
     if "NFCE" in t:
@@ -142,7 +155,6 @@ def carregar_certificados_validos() -> List[Dict[str, Any]]:
     """Busca certificados em certifica_dfe via REST."""
     url = f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}"
     params = {
-        # nota: "cnpj/cpf" precisa ficar entre aspas duplas
         "select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf"'
     }
     print("🔎 Buscando certificados na tabela certifica_dfe (REST Supabase)...")
@@ -151,7 +163,6 @@ def carregar_certificados_validos() -> List[Dict[str, Any]]:
     certs = r.json() or []
     print(f"   ✔ {len(certs)} certificados encontrados.")
     return certs
-
 
 def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
     """Decodifica pem/key em Base64 e grava em arquivos temporários para usar no requests."""
@@ -176,36 +187,59 @@ def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
     return cert_file.name, key_file.name
 
 
-def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
+# ---------------------------
+# Storage: URLs seguras
+# ---------------------------
+def _storage_object_url_privado(storage_path: str) -> str:
     """
-    Verifica se o arquivo já existe usando a URL pública:
-    /storage/v1/object/public/imagens/notas/<arquivo>
+    Endpoint privado (com Authorization):
+      /storage/v1/object/{bucket}/{path}
+
+    ✅ encode preservando "/" mas escapando @, espaços etc.
     """
     storage_path = storage_path.lstrip("/")
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_IMAGENS}/{storage_path}"
+    encoded_path = quote(storage_path, safe="/")
+    return f"{SUPABASE_URL}/storage/v1/object/{BUCKET_IMAGENS}/{encoded_path}"
+
+def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
+    """
+    ✅ Checa existência com endpoint privado + URL-encode (corrige 400 por causa de '@')
+    Tenta HEAD e, se o servidor não aceitar, tenta GET.
+    """
+    url = _storage_object_url_privado(storage_path)
+    headers = supabase_headers()
 
     try:
-        r = requests.head(public_url, timeout=15)
-        if r.status_code in (200, 206):
+        r = requests.head(url, headers=headers, timeout=20)
+        if r.status_code == 200:
             print(f"   ⚠️ Arquivo já existente no storage: {storage_path}")
             return True
-        elif r.status_code == 404:
+        if r.status_code == 404:
             return False
-        else:
-            print(f"   ⚠️ HEAD inesperado ({r.status_code}) ao checar {storage_path}")
-            return False
+
+        if r.status_code in (400, 401, 403, 405):
+            r2 = requests.get(url, headers=headers, timeout=20, stream=True)
+            if r2.status_code == 200:
+                print(f"   ⚠️ Arquivo já existente no storage: {storage_path}")
+                return True
+            if r2.status_code == 404:
+                return False
+
+        print(f"   ⚠️ Checagem existência retornou {r.status_code} (HEAD) para {storage_path}")
+        return False
+
     except Exception as e:
         print(f"   ⚠️ Erro ao checar existência no storage ({storage_path}): {e}")
         return False
 
-
 def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = "application/zip") -> bool:
     """
     Upload via REST:
-    POST /storage/v1/object/{bucket}/{path}
+      POST /storage/v1/object/{bucket}/{path}
+
+    ✅ path URL-encoded (senão '@' pode quebrar a rota)
     """
-    storage_path = storage_path.lstrip("/")
-    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_IMAGENS}/{storage_path}"
+    url = _storage_object_url_privado(storage_path)
     headers = supabase_headers()
     headers["Content-Type"] = content_type
 
@@ -221,7 +255,6 @@ def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = 
         print(f"   ❌ Erro ao fazer upload para Supabase ({storage_path}): {e}")
         return False
 
-
 def montar_nome_final_arquivo(
     base_name: str,
     empresa: str,
@@ -231,24 +264,17 @@ def montar_nome_final_arquivo(
     doc: str,
 ) -> str:
     """
-    base_name: ex: 'NFe_12345.zip'
-    doc: CNPJ/CPF (pode vir com máscara, aqui limpamos)
-
     Padrão:
       AAAAMM-<codi>-<doc>-<email>-<base_name>
     """
-    doc_clean = somente_numeros(doc)
-    if not doc_clean:
-        doc_clean = "sem-doc"
-
+    doc_clean = somente_numeros(doc) or "sem-doc"
     cod_str = str(codi) if codi is not None else "0"
-    email = user or "sem-user"  # e-mail “cru” mesmo, sem slug
-
+    email = user or "sem-user"  # mantém e-mail cru
     return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
 
 
 # =========================================================
-# SESSÃO E UTILS
+# SESSÃO (mTLS)
 # =========================================================
 def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
     s = requests.Session()
@@ -270,25 +296,6 @@ def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
         "Connection": "keep-alive",
     })
     return s
-
-
-def mes_anterior() -> Tuple[str, str]:
-    """Datas do mês anterior no formato DD/MM/YYYY (baseado no fuso de Rondônia)."""
-    hoje = hoje_ro()
-    inicio_mes_atual = hoje.replace(day=1)
-    fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
-    inicio_mes_anterior = fim_mes_anterior.replace(day=1)
-
-    return (
-        inicio_mes_anterior.strftime("%d/%m/%Y"),
-        fim_mes_anterior.strftime("%d/%m/%Y"),
-    )
-
-
-def periodo_mes_anterior_str() -> str:
-    """Retorna 'DD/MM/YYYY a DD/MM/YYYY' do mês anterior (fuso de Rondônia)."""
-    ini, fim = mes_anterior()
-    return f"{ini} a {fim}"
 
 
 # =========================================================
@@ -323,7 +330,6 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
             print("❌ Erro ao criar task no Anti-Captcha (Chave inválida?):", resp)
             return None
 
-        # Polling
         for _ in range(5):
             time.sleep(3)
             r = requests.post(
@@ -353,7 +359,7 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
 
 
 # =========================================================
-# PARTE 1 — CRIAR SOLICITAÇÕES (por tipo) DO MÊS ANTERIOR
+# PARTE 1 — CRIAR SOLICITAÇÕES (NFe, CTe, NFCe) DO MÊS ANTERIOR
 # =========================================================
 def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -370,7 +376,6 @@ def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]
 
     form = soup.find("form", {"id": "frm_solicitacao"})
     action_url_relative = form.get("action") if form and form.get("action") else None
-
     if not action_url_relative:
         raise Exception("ERRO: O atributo 'action' do formulário está vazio.")
 
@@ -391,11 +396,7 @@ def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]
     return csrf_token, token_captcha, cnpj_limpo, URL_CREATE, img_bytes, b64
 
 
-def enviar_solicitacao_unica(
-    s: requests.Session,
-    dfe_name: str,
-    dfe_type_code: str,
-) -> bool:
+def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: str) -> bool:
     print("\n========================================================")
     print(f"🚀 INICIANDO SOLICITAÇÃO: {dfe_name} (Tipo: {dfe_type_code})")
     print("========================================================")
@@ -414,11 +415,7 @@ def enviar_solicitacao_unica(
         print(f"❌ Erro na extração dos dados: {e}")
         return False
 
-    captcha_resposta: Optional[str] = None
-    if ANTI_CAPTCHA_KEY:
-        captcha_resposta = resolver_captcha_anticaptcha(b64_captcha)
-    else:
-        print("AVISO: ANTI_CAPTCHA_KEY não configurada. Partindo para o modo manual.")
+    captcha_resposta: Optional[str] = resolver_captcha_anticaptcha(b64_captcha)
 
     if not captcha_resposta:
         print("\n====================================================================")
@@ -458,7 +455,6 @@ def enviar_solicitacao_unica(
     print(f"⏱️ TEMPO TOTAL GASTO ANTES DO POST: {total_elapsed_time:.2f} segundos.")
 
     r_post = s.post(URL_CREATE, data=payload, headers=headers, timeout=60, allow_redirects=False)
-
     print(f"   Status FINAL do POST: {r_post.status_code}")
 
     success = False
@@ -486,8 +482,8 @@ def enviar_solicitacao_unica(
 
 def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[List[str]] = None):
     """
-    Se 'apenas_tipos' for informado, abre solicitações somente para estes tipos:
-      ['NFe','CTe','NFCe']
+    Abre solicitações do mês anterior. Se 'apenas_tipos' informado, solicita só os faltantes.
+      ex: ['NFe','CTe']
     """
     if apenas_tipos is None:
         tipos = list(DFE_TYPES_MAP.items())
@@ -495,10 +491,6 @@ def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[Li
         tipos = [(k, DFE_TYPES_MAP[k]) for k in apenas_tipos if k in DFE_TYPES_MAP]
 
     print("\n=== INICIANDO ABERTURA DE NOVAS SOLICITAÇÕES (MÊS ANTERIOR) ===")
-    if not tipos:
-        print("   ⚠️ Nenhum tipo para solicitar.")
-        return
-
     for dfe_name, dfe_type_code in tipos:
         tentativas = 0
         success = False
@@ -520,7 +512,7 @@ def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[Li
 
 
 # =========================================================
-# PARTE 2 — LISTAR TODAS AS SOLICITAÇÕES (COM ESTADO)
+# PARTE 2 — LISTAR TODAS AS SOLICITAÇÕES
 # =========================================================
 def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
     """
@@ -582,11 +574,14 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
     return itens
 
 
+# =========================================================
+# DETALHES: PERÍODO + DOC (quando existir)
+# =========================================================
 def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Dict[str, Optional[str]]:
     """
     Abre detalhes e tenta extrair:
       - periodo (PERÍODO)
-      - doc (CNPJ/CPF)
+      - doc (CNPJ/CPF) se aparecer
     """
     url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
     r = s.get(url, timeout=30)
@@ -597,7 +592,7 @@ def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Di
     soup = BeautifulSoup(r.text, "lxml")
     tabela = soup.find("table", class_=re.compile("table-xxs"))
     if not tabela:
-        print(f"   ❌ Tabela de detalhes não encontrada em {solicitacao_id}.")
+        # não falha geral, só retorna N/D
         return {"periodo": None, "doc": None}
 
     periodo = None
@@ -613,13 +608,15 @@ def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Di
         if "PERÍODO" in k:
             periodo = v
 
-        # tenta achar algo como CNPJ/CPF, CPF/CNPJ, CNPJ, CPF
         if ("CNPJ" in k) or ("CPF" in k):
             doc = somente_numeros(v) or doc
 
     return {"periodo": periodo, "doc": doc}
 
 
+# =========================================================
+# DOWNLOAD
+# =========================================================
 def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tuple[str, str]]:
     detalhes_url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
     r = s.get(detalhes_url, timeout=30)
@@ -645,10 +642,6 @@ def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tupl
 
 
 def extrair_html_modal(js: str) -> Optional[str]:
-    """
-    Tenta extrair o HTML do modal a partir do JS (caso venha com $("#bloco_modal").html('...')),
-    e, se não encontrar, assume que o próprio corpo já é HTML do modal.
-    """
     m = re.search(r'\$\("#bloco_modal"\)\.html\((?P<q>[\'"])(.+?)(?P=q)\)', js, re.S)
     if m:
         raw = m.group(2)
@@ -667,13 +660,8 @@ def extrair_html_modal(js: str) -> Optional[str]:
     return None
 
 
-def realizar_download_dfe(
-    s: requests.Session,
-    solicitacao_data: Dict[str, str],
-    storage_path: str,
-) -> bool:
+def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, str], storage_path: str) -> bool:
     solicitacao_id = solicitacao_data["id"]
-
     print("\n⬇️ Iniciando download do ID", solicitacao_id)
 
     res = obter_url_captcha(s, solicitacao_id)
@@ -690,7 +678,6 @@ def realizar_download_dfe(
         },
         timeout=30,
     )
-
     if r_get.status_code != 200:
         print("❌ Erro HTTP ao buscar get_captcha_download:", r_get.status_code)
         return False
@@ -725,41 +712,31 @@ def realizar_download_dfe(
             return False
 
     print("3️⃣ Enviando GET final para baixar o ZIP...")
-
-    params = {
-        "token": token,
-        "captcha_resposta": captcha,
-    }
-
+    params = {"token": token, "captcha_resposta": captcha}
     r_final = s.get(action, params=params, stream=True, timeout=120)
+
     content_type = (r_final.headers.get("Content-Type") or "").lower()
-
     if "application/zip" in content_type or "application/octet-stream" in content_type:
-        conteudo = b""
-        for chunk in r_final.iter_content(8192):
-            if chunk:
-                conteudo += chunk
-
-        ok = upload_para_storage(storage_path, conteudo, content_type="application/zip")
-        return ok
+        conteudo = b"".join(chunk for chunk in r_final.iter_content(8192) if chunk)
+        return upload_para_storage(storage_path, conteudo, content_type="application/zip")
 
     print("❌ Falha no GET final. Content-Type:", content_type, "| Status:", r_final.status_code)
     return False
 
 
 # =========================================================
-# FLUXO POR EMPRESA (CERTIFICADO) — AJUSTADO (PERÍODO + TIPO + DOC)
+# FLUXO POR EMPRESA (PERÍODO + TIPO + DOC) + NÃO DUPLICAR
 # =========================================================
 def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
     user = cert_row.get("user") or ""
     codi = cert_row.get("codi")
     venc = cert_row.get("vencimento")
-    doc_raw = cert_row.get("cnpj/cpf") or ""   # CNPJ/CPF da tabela
-    doc_alvo = somente_numeros(doc_raw) or ""
+    doc = cert_row.get("cnpj/cpf") or ""
+    doc_alvo = somente_numeros(doc) or ""
 
     print("\n\n========================================================")
-    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
+    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc} | venc: {venc}")
     print("========================================================")
 
     try:
@@ -769,13 +746,13 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         print("❌ Erro ao criar sessão com certificado:", e)
         return
 
-    print("\n--- INICIANDO VERIFICAÇÃO / SOLICITAÇÕES / DOWNLOADS ---")
+    print("--- INICIANDO VERIFICAÇÃO / SOLICITAÇÕES / DOWNLOADS ---")
     solicitacoes = listar_solicitacoes(s)
 
     periodo_alvo = periodo_mes_anterior_str()
     mes_cod = mes_anterior_codigo()
 
-    # controla “já existe solicitação do mês anterior” POR TIPO (NFe/CTe/NFCe) e para ESTE doc
+    # Controla “já existe solicitação do mês anterior” POR TIPO para este doc
     existe_por_tipo: Dict[str, bool] = {k: False for k in DFE_TYPES_MAP.keys()}
 
     if solicitacoes:
@@ -783,48 +760,38 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
             solicitacao_id = item["id"]
             estado = (item.get("estado") or "").upper()
 
-            # 1) Normaliza o tipo do DFe da linha (documento)
             tipo_norm = normalizar_tipo_documento(item.get("documento", ""))
             if not tipo_norm or tipo_norm not in DFE_TYPES_MAP:
-                # não é um dos tipos que queremos controlar
                 continue
 
-            # 2) Busca detalhes UMA vez e extrai periodo + doc
             det = extrair_detalhes_solicitacao(s, solicitacao_id)
             periodo = (det.get("periodo") or "").strip()
             doc_det = somente_numeros(det.get("doc")) if det.get("doc") else ""
 
-            if not periodo:
-                print(f"   ⛔ Período não identificado para ID {solicitacao_id}. Ignorando.")
+            # Filtro período
+            if not periodo or periodo != periodo_alvo:
                 continue
 
-            # 3) Filtros: PERÍODO + DOC (CNPJ/CPF) + TIPO
-            if periodo != periodo_alvo:
-                # print controlado para não poluir demais:
-                # print(f"   ⛔ ID {solicitacao_id}: período diferente ({periodo})")
-                continue
-
+            # Filtro doc (só se o detalhe trouxer doc)
             if doc_alvo and doc_det and doc_det != doc_alvo:
-                # Se o site realmente informa doc nos detalhes, garantimos que é o mesmo da empresa.
                 continue
 
-            # Passou: é do mês anterior, do tipo correto, e do doc correto.
             existe_por_tipo[tipo_norm] = True
             print(f"✔ Solicitação {solicitacao_id} | tipo: {tipo_norm} | período: {periodo} | estado: {estado} | doc(det): {doc_det or 'N/D'}")
 
-            # 4) Download só quando estiver em DOWNLOAD
             if estado == "DOWNLOAD":
-                base_name = item["file_name"]  # ex: NFE_17448627.zip
+                base_name = item["file_name"]
                 nome_final = montar_nome_final_arquivo(
                     base_name=base_name,
                     empresa=empresa,
                     user=user,
                     codi=codi,
                     mes_cod=mes_cod,
-                    doc=doc_alvo or doc_raw,
+                    doc=doc_alvo or doc,
                 )
-                storage_path = f"{PASTA_NOTAS}/{nome_final}"  # notas/<arquivo.zip>
+                storage_path = f"{PASTA_NOTAS}/{nome_final}"
 
+                # ✅ aqui é o ponto que estava causando duplicação: agora detecta certo mesmo com "@"
                 if arquivo_ja_existe_no_storage(storage_path):
                     print(f"   ⤵ Já existe no Supabase, não será baixado novamente: {storage_path}")
                     continue
@@ -845,12 +812,11 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
             else:
                 print(f"   🔄 ID {solicitacao_id} ainda está em '{estado}'. Aguardando próxima varredura.")
 
-        # 5) Decisão de abrir novas solicitações: agora é POR TIPO + PERÍODO + DOC
+        # Abrir novas solicitações só para tipos faltantes
         faltando = [k for k, v in existe_por_tipo.items() if not v]
-
         if not faltando:
             print("\n✅ Já existe solicitação do MÊS ANTERIOR para ESTE DOC em TODOS os tipos (NFe/CTe/NFCe).")
-            print("   ❌ Não será aberta nova solicitação agora (evita duplicar).")
+            print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
         else:
             print("\n⚠️ Estão faltando solicitações do mês anterior para este DOC nos tipos:", ", ".join(faltando))
             print("➡️ Abrindo novas solicitações SOMENTE para os tipos faltantes...")
@@ -858,7 +824,7 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
 
     else:
         print("\n⚠️ Nenhuma solicitação encontrada na lista.")
-        print("➡️ Abrindo novas solicitações para o mês anterior (todos os tipos)...")
+        print("➡️ Abrindo novas solicitações para o mês anterior...")
         enviar_solicitacao_sequencial(s)
 
 
