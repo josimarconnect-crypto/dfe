@@ -9,7 +9,6 @@ from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo  # 👈 Fuso horário
-from urllib.parse import quote  # ✅ URL-encode do path (corrige 400 no HEAD/POST)
 
 # =========================================================
 # === CONFIGURAÇÕES SUPABASE (via REST) ===================
@@ -35,10 +34,8 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 # === CONFIGURAÇÕES GERAIS ================================
 # =========================================================
 
-# 🚨 CHAVE ANTI-CAPTCHA
 ANTI_CAPTCHA_KEY = "60ce5191cf427863d4f3c79ee20e4afe"
 
-# URLs gerais
 URL_HOME  = "https://dfe.sefin.ro.gov.br/"
 URL_BASE  = "https://download.dfe.sefin.ro.gov.br"
 URL_NOVO  = URL_BASE + "/solicitacoes/novo"
@@ -46,19 +43,15 @@ URL_SOLICITACOES       = URL_BASE + "/solicitacoes"
 URL_DETALHES_TEMPLATE  = URL_BASE + "/solicitacoes/detalhes/{id}"
 URL_CREATE_BASE        = URL_BASE
 
-# Tipos DFe
 DFE_TYPES_MAP = {
-    "NFe": "0",   # Nota Fiscal Eletrônica
-    "CTe": "1",   # Conhecimento de Transporte Eletrônica
-    "NFCe": "2",  # Nota Fiscal de Consumidor Eletrônica
+    "NFe": "0",
+    "CTe": "1",
+    "NFCe": "2",
 }
 
 TIPO_SOLICITACAO = "1"  # 1=PERIODO
-
 MAX_TENTATIVAS = 5
-DELAY_ENTRE_TENTATIVAS = 2  # seg
-
-# intervalo entre varreduras (ex.: 36)
+DELAY_ENTRE_TENTATIVAS = 2
 INTERVALO_LOOP_SEGUNDOS = 36
 
 
@@ -68,39 +61,24 @@ INTERVALO_LOOP_SEGUNDOS = 36
 FUSO_RO = ZoneInfo("America/Porto_Velho")
 
 def hoje_ro() -> date:
-    """
-    Retorna a data de hoje considerando o fuso de Rondônia (America/Porto_Velho),
-    independentemente do fuso do servidor (ex.: UTC no Render).
-    """
     return datetime.now(FUSO_RO).date()
 
 
 # =========================================================
 # FUNÇÕES AUXILIARES
 # =========================================================
-def slugify(valor: str) -> str:
-    if not valor:
-        return "sem-nome"
-    s = valor.lower().strip()
-    s = s.replace("@", "-at-")
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = s.strip("-")
-    return s or "sem-nome"
-
 def somente_numeros(s: Optional[str]) -> str:
     if not s:
         return ""
     return re.sub(r"\D+", "", s)
 
 def mes_anterior_codigo() -> str:
-    """Retorna código AAAAMM do mês anterior (baseado no fuso de Rondônia)."""
     hoje = hoje_ro()
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
     return fim_mes_anterior.strftime("%Y%m")
 
 def mes_anterior() -> Tuple[str, str]:
-    """Datas do mês anterior no formato DD/MM/YYYY (baseado no fuso de Rondônia)."""
     hoje = hoje_ro()
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
@@ -111,52 +89,34 @@ def mes_anterior() -> Tuple[str, str]:
     )
 
 def periodo_mes_anterior_str() -> str:
-    """Retorna 'DD/MM/YYYY a DD/MM/YYYY' do mês anterior (fuso de Rondônia)."""
     ini, fim = mes_anterior()
     return f"{ini} a {fim}"
 
 def normalizar_tipo_documento(texto: str) -> Optional[str]:
     """
-    Normaliza o texto da coluna 'DOCUMENTO' da listagem para um dos:
-      'NFe', 'CTe', 'NFCe'
+    Normaliza a coluna 'DOCUMENTO' da listagem para: NFe / CTe / NFCe
     """
     if not texto:
         return None
-    t = texto.strip().upper()
-    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s+", " ", texto.strip().upper())
 
-    # CTe
     if "CTE" in t or "CT-E" in t or "CONHECIMENTO" in t:
         return "CTe"
-    # NFCe
     if "NFCE" in t or "NFC-E" in t or "CONSUMIDOR" in t:
         return "NFCe"
-    # NFe (cuidado com NFCe)
     if "NFE" in t or "NF-E" in t or "NOTA FISCAL" in t:
         if "NFC" in t:
             return "NFCe"
         return "NFe"
-
-    # fallbacks
-    if "CTE" in t:
-        return "CTe"
-    if "NFCE" in t:
-        return "NFCe"
-    if "NFE" in t:
-        return "NFe"
-
     return None
 
 
 # =========================================================
-# FUNÇÕES SUPABASE: CERTIFICADOS + STORAGE
+# SUPABASE: CERTIFICADOS
 # =========================================================
 def carregar_certificados_validos() -> List[Dict[str, Any]]:
-    """Busca certificados em certifica_dfe via REST."""
     url = f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}"
-    params = {
-        "select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf"'
-    }
+    params = {"select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf"'}
     print("🔎 Buscando certificados na tabela certifica_dfe (REST Supabase)...")
     r = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
     r.raise_for_status()
@@ -165,7 +125,6 @@ def carregar_certificados_validos() -> List[Dict[str, Any]]:
     return certs
 
 def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
-    """Decodifica pem/key em Base64 e grava em arquivos temporários para usar no requests."""
     pem_b64 = cert_row.get("pem") or ""
     key_b64 = cert_row.get("key") or ""
 
@@ -173,73 +132,65 @@ def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
     key_bytes = base64.b64decode(key_b64)
 
     cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
-    key_file = tempfile.NamedTemporaryFile(delete=False, suffix=".key")
+    key_file  = tempfile.NamedTemporaryFile(delete=False, suffix=".key")
 
-    cert_file.write(pem_bytes)
-    cert_file.flush()
-    cert_file.close()
-
-    key_file.write(key_bytes)
-    key_file.flush()
-    key_file.close()
+    cert_file.write(pem_bytes); cert_file.flush(); cert_file.close()
+    key_file.write(key_bytes);  key_file.flush();  key_file.close()
 
     print(f"   ✔ Arquivos temporários de certificado criados: {cert_file.name}, {key_file.name}")
     return cert_file.name, key_file.name
 
 
-# ---------------------------
-# Storage: URLs seguras
-# ---------------------------
-def _storage_object_url_privado(storage_path: str) -> str:
-    """
-    Endpoint privado (com Authorization):
-      /storage/v1/object/{bucket}/{path}
-
-    ✅ encode preservando "/" mas escapando @, espaços etc.
-    """
-    storage_path = storage_path.lstrip("/")
-    encoded_path = quote(storage_path, safe="/")
-    return f"{SUPABASE_URL}/storage/v1/object/{BUCKET_IMAGENS}/{encoded_path}"
-
+# =========================================================
+# SUPABASE: STORAGE (CHECAGEM POR LIST = ROBUSTA)
+# =========================================================
 def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
     """
-    ✅ Checa existência com endpoint privado + URL-encode (corrige 400 por causa de '@')
-    Tenta HEAD e, se o servidor não aceitar, tenta GET.
+    ✅ Checagem robusta via LIST:
+      POST /storage/v1/object/list/{bucket}
+    Não depende de HEAD no objeto (que estava retornando 400 em alguns casos).
     """
-    url = _storage_object_url_privado(storage_path)
-    headers = supabase_headers()
+    storage_path = storage_path.lstrip("/")
+    pasta = os.path.dirname(storage_path).replace("\\", "/")  # ex: "notas"
+    arquivo = os.path.basename(storage_path)                  # ex: "...-NFE_123.zip"
+
+    url = f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET_IMAGENS}"
+    headers = supabase_headers(is_json=True)
+
+    payload = {
+        "prefix": pasta,
+        "search": arquivo,
+        "limit": 100,
+        "offset": 0,
+        "sortBy": {"column": "name", "order": "asc"},
+    }
 
     try:
-        r = requests.head(url, headers=headers, timeout=20)
-        if r.status_code == 200:
-            print(f"   ⚠️ Arquivo já existente no storage: {storage_path}")
-            return True
-        if r.status_code == 404:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code != 200:
+            print(f"   ⚠️ LIST retornou {r.status_code} ao checar {storage_path}: {r.text[:200]}")
             return False
 
-        if r.status_code in (400, 401, 403, 405):
-            r2 = requests.get(url, headers=headers, timeout=20, stream=True)
-            if r2.status_code == 200:
-                print(f"   ⚠️ Arquivo já existente no storage: {storage_path}")
-                return True
-            if r2.status_code == 404:
-                return False
+        itens = r.json() or []
+        existe = any((i.get("name") == arquivo) for i in itens)
 
-        print(f"   ⚠️ Checagem existência retornou {r.status_code} (HEAD) para {storage_path}")
+        if existe:
+            print(f"   ⚠️ Arquivo já existente no storage: {storage_path}")
+            return True
         return False
 
     except Exception as e:
-        print(f"   ⚠️ Erro ao checar existência no storage ({storage_path}): {e}")
+        print(f"   ⚠️ Erro ao checar existência no storage (LIST) ({storage_path}): {e}")
         return False
+
 
 def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = "application/zip") -> bool:
     """
     Upload via REST:
       POST /storage/v1/object/{bucket}/{path}
-
-    ✅ path URL-encoded (senão '@' pode quebrar a rota)
     """
-    url = _storage_object_url_privado(storage_path)
+    storage_path = storage_path.lstrip("/")
+    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_IMAGENS}/{storage_path}"
     headers = supabase_headers()
     headers["Content-Type"] = content_type
 
@@ -248,12 +199,12 @@ def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = 
         if r.status_code in (200, 201):
             print(f"   🎉 Upload realizado para Supabase: {storage_path}")
             return True
-        else:
-            print(f"   ❌ Erro upload ({r.status_code}) {storage_path}: {r.text}")
-            return False
+        print(f"   ❌ Erro upload ({r.status_code}) {storage_path}: {r.text}")
+        return False
     except Exception as e:
         print(f"   ❌ Erro ao fazer upload para Supabase ({storage_path}): {e}")
         return False
+
 
 def montar_nome_final_arquivo(
     base_name: str,
@@ -263,10 +214,6 @@ def montar_nome_final_arquivo(
     mes_cod: str,
     doc: str,
 ) -> str:
-    """
-    Padrão:
-      AAAAMM-<codi>-<doc>-<email>-<base_name>
-    """
     doc_clean = somente_numeros(doc) or "sem-doc"
     cod_str = str(codi) if codi is not None else "0"
     email = user or "sem-user"  # mantém e-mail cru
@@ -274,16 +221,12 @@ def montar_nome_final_arquivo(
 
 
 # =========================================================
-# SESSÃO (mTLS)
+# SESSÃO mTLS
 # =========================================================
 def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
     s = requests.Session()
-    try:
-        s.cert = (cert_path, key_path)
-        print("✅ Certificado e chave carregados com sucesso.")
-    except Exception as e:
-        print(f"❌ ERRO FATAL AO CARREGAR CERTIFICADOS: {e}")
-        raise
+    s.cert = (cert_path, key_path)
+    print("✅ Certificado e chave carregados com sucesso.")
 
     s.headers.update({
         "User-Agent": (
@@ -325,9 +268,8 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
         r.raise_for_status()
         resp = r.json()
         task_id = resp.get("taskId")
-
         if not task_id:
-            print("❌ Erro ao criar task no Anti-Captcha (Chave inválida?):", resp)
+            print("❌ Erro ao criar task no Anti-Captcha:", resp)
             return None
 
         for _ in range(5):
@@ -350,7 +292,7 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
                 print("❌ Anti-CAPTCHA retornou erro:", result)
                 return None
 
-        print("❌ Anti-Captcha não conseguiu resolver o captcha a tempo (Timeout).")
+        print("❌ Anti-Captcha não conseguiu resolver a tempo (Timeout).")
         return None
 
     except Exception as e:
@@ -359,7 +301,7 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
 
 
 # =========================================================
-# PARTE 1 — CRIAR SOLICITAÇÕES (NFe, CTe, NFCe) DO MÊS ANTERIOR
+# CRIAR SOLICITAÇÕES (MÊS ANTERIOR)
 # =========================================================
 def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -389,7 +331,6 @@ def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]
     img_bytes = base64.b64decode(b64)
 
     print(f"   ✅ Tokens extraídos. CNPJ: {cnpj_limpo}")
-
     if not csrf_token or not token_captcha or not cnpj_limpo:
         raise Exception("Erro na extração dos tokens de segurança (CSRF, Token, CNPJ).")
 
@@ -410,13 +351,12 @@ def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: 
         return False
 
     try:
-        csrf_token, token_captcha, cnpj_limpo, URL_CREATE, img_bytes, b64_captcha = extrair_tokens_e_captcha(r_novo.text)
+        csrf_token, token_captcha, cnpj_limpo, URL_CREATE, _img_bytes, b64_captcha = extrair_tokens_e_captcha(r_novo.text)
     except Exception as e:
         print(f"❌ Erro na extração dos dados: {e}")
         return False
 
     captcha_resposta: Optional[str] = resolver_captcha_anticaptcha(b64_captcha)
-
     if not captcha_resposta:
         print("\n====================================================================")
         print("🛑 MODO MANUAL: Resolução automática falhou ou não configurada.")
@@ -451,55 +391,45 @@ def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: 
     }
 
     print("\n👉 2. Enviando solicitação POST...")
-    total_elapsed_time = time.time() - start_total_time
-    print(f"⏱️ TEMPO TOTAL GASTO ANTES DO POST: {total_elapsed_time:.2f} segundos.")
+    print(f"⏱️ TEMPO TOTAL GASTO ANTES DO POST: {(time.time() - start_total_time):.2f} segundos.")
 
     r_post = s.post(URL_CREATE, data=payload, headers=headers, timeout=60, allow_redirects=False)
     print(f"   Status FINAL do POST: {r_post.status_code}")
 
-    success = False
     if r_post.status_code == 302:
-        redirect_url = r_post.headers.get("Location", "URL de Redirecionamento não encontrada")
         print("🎉 SUCESSO COMPLETO (302 REDIRECIONAMENTO).")
-        print(f"   Solicitação de {dfe_name} aceita e enviada para: {redirect_url}")
-        success = True
-    elif r_post.status_code == 200:
+        return True
+
+    if r_post.status_code == 200:
         response_text = r_post.text.strip()
         print(f"   Resposta do Servidor (200): {response_text}")
-
         if response_text == '{"status":"Texto de verificação inválido"}':
             print(f"❌ ERRO CRÍTICO: 'Texto de verificação inválido' ({dfe_name}).")
-        elif '"status":"ok"' in response_text or '"status":"success"' in response_text:
-            print(f"✅ SUCESSO: Solicitação de {dfe_name} aceita (Status JSON OK/SUCCESS).")
-            success = True
-        else:
-            print(f"🛑 ERRO DE VALIDAÇÃO (200): verificar conteúdo para {dfe_name}.")
-    else:
-        print(f"🛑 ERRO INESPERADO: Status {r_post.status_code} em {dfe_name}.")
+            return False
+        if '"status":"ok"' in response_text or '"status":"success"' in response_text:
+            print(f"✅ SUCESSO: Solicitação de {dfe_name} aceita.")
+            return True
+        print(f"🛑 ERRO DE VALIDAÇÃO (200): verificar conteúdo para {dfe_name}.")
+        return False
 
-    return success
+    print(f"🛑 ERRO INESPERADO: Status {r_post.status_code} em {dfe_name}.")
+    return False
 
 
 def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[List[str]] = None):
     """
-    Abre solicitações do mês anterior. Se 'apenas_tipos' informado, solicita só os faltantes.
-      ex: ['NFe','CTe']
+    Se apenas_tipos for informado (ex: ['NFe','CTe']), solicita só esses.
     """
-    if apenas_tipos is None:
-        tipos = list(DFE_TYPES_MAP.items())
-    else:
-        tipos = [(k, DFE_TYPES_MAP[k]) for k in apenas_tipos if k in DFE_TYPES_MAP]
+    tipos = list(DFE_TYPES_MAP.items()) if apenas_tipos is None else [(t, DFE_TYPES_MAP[t]) for t in apenas_tipos if t in DFE_TYPES_MAP]
 
     print("\n=== INICIANDO ABERTURA DE NOVAS SOLICITAÇÕES (MÊS ANTERIOR) ===")
     for dfe_name, dfe_type_code in tipos:
         tentativas = 0
         success = False
-
         while tentativas < MAX_TENTATIVAS and not success:
             if tentativas > 0:
                 print(f"\n--- TENTATIVA {tentativas + 1} de {MAX_TENTATIVAS} para {dfe_name} ---")
                 time.sleep(DELAY_ENTRE_TENTATIVAS)
-
             success = enviar_solicitacao_unica(s, dfe_name, dfe_type_code)
             tentativas += 1
 
@@ -507,18 +437,13 @@ def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[Li
             print(f"\n[SEQUÊNCIA] {dfe_name} falhou após {MAX_TENTATIVAS} tentativas.")
         else:
             print(f"\n[SUCESSO] {dfe_name} solicitado.")
-            print(f"[PAUSA] Aguardando {DELAY_ENTRE_TENTATIVAS} segundos antes do próximo tipo.")
             time.sleep(DELAY_ENTRE_TENTATIVAS)
 
 
 # =========================================================
-# PARTE 2 — LISTAR TODAS AS SOLICITAÇÕES
+# LISTAR SOLICITAÇÕES
 # =========================================================
 def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
-    """
-    Lista TODAS as solicitações (independente de estado),
-    para depois filtrar por período + tipo + doc no fluxo.
-    """
     print("🔎 Acessando lista de solicitações...")
     r = s.get(URL_SOLICITACOES, timeout=30)
     if r.status_code != 200:
@@ -564,7 +489,7 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
         if solicitacao_id:
             itens.append({
                 "id": solicitacao_id,
-                "documento": tipo_documento,  # texto da tabela
+                "documento": tipo_documento,
                 "estado": estado,
                 "data": data_full,
                 "file_name": f"{tipo_documento}_{solicitacao_id}.zip".replace(" ", "_").replace("/", "-"),
@@ -578,21 +503,14 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
 # DETALHES: PERÍODO + DOC (quando existir)
 # =========================================================
 def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Dict[str, Optional[str]]:
-    """
-    Abre detalhes e tenta extrair:
-      - periodo (PERÍODO)
-      - doc (CNPJ/CPF) se aparecer
-    """
     url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
     r = s.get(url, timeout=30)
     if r.status_code != 200:
-        print(f"   ❌ Erro ao abrir Detalhes {solicitacao_id}: {r.status_code}")
         return {"periodo": None, "doc": None}
 
     soup = BeautifulSoup(r.text, "lxml")
     tabela = soup.find("table", class_=re.compile("table-xxs"))
     if not tabela:
-        # não falha geral, só retorna N/D
         return {"periodo": None, "doc": None}
 
     periodo = None
@@ -602,6 +520,7 @@ def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Di
         tds = tr.find_all("td")
         if len(tds) < 2:
             continue
+
         k = tds[0].get_text(strip=True).upper()
         v = tds[1].get_text(strip=True)
 
@@ -615,7 +534,59 @@ def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Di
 
 
 # =========================================================
-# DOWNLOAD
+# SELEÇÃO: 1 SOLICITAÇÃO POR TIPO (TIPO + PERÍODO)
+# =========================================================
+def _parse_id_num(solicitacao_id: str) -> int:
+    try:
+        return int(re.sub(r"\D+", "", solicitacao_id or "") or "0")
+    except Exception:
+        return 0
+
+def _peso_estado(estado: str) -> int:
+    """
+    Quanto maior, mais 'pronto'. Ajuste se aparecerem novos nomes.
+    """
+    e = (estado or "").upper()
+    if "DOWNLOAD" in e:
+        return 100
+    if "GERANDO" in e:
+        return 80
+    if "PROCESS" in e:
+        return 60
+    if "FINALIZ" in e or "FINAL" in e:
+        return 50
+    if "ERRO" in e or "FALH" in e:
+        return 10
+    return 30
+
+def selecionar_uma_por_tipo(solicitacoes_filtradas: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Escolhe somente 1 por tipo, preferindo:
+      1) maior peso de estado (DOWNLOAD > GERANDO > PROCESSANDO > ...)
+      2) maior ID (mais recente) como desempate
+    """
+    melhor: Dict[str, Dict[str, Any]] = {}
+    for it in solicitacoes_filtradas:
+        tipo = it.get("tipo_norm")
+        if not tipo:
+            continue
+        score = (_peso_estado(it.get("estado", "")), _parse_id_num(it.get("id")))
+        cur = melhor.get(tipo)
+        if not cur:
+            it["_score"] = score
+            melhor[tipo] = it
+            continue
+        if score > cur.get("_score", (0, 0)):
+            it["_score"] = score
+            melhor[tipo] = it
+
+    for k in list(melhor.keys()):
+        melhor[k].pop("_score", None)
+    return melhor
+
+
+# =========================================================
+# DOWNLOAD (CAPTCHA POPUP)
 # =========================================================
 def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tuple[str, str]]:
     detalhes_url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
@@ -625,12 +596,7 @@ def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tupl
         return None
 
     soup = BeautifulSoup(r.text, "lxml")
-    link = soup.find(
-        "a",
-        class_=re.compile(r"\blink-detalhe\b"),
-        href=re.compile(r"get_captcha_download"),
-    )
-
+    link = soup.find("a", class_=re.compile(r"\blink-detalhe\b"), href=re.compile(r"get_captcha_download"))
     if not link or not link.has_attr("href"):
         print("❌ Não achei o link do ARQUIVO (get_captcha_download) na página de Detalhes.")
         return None
@@ -640,18 +606,16 @@ def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tupl
     print(f"   ✅ URL do pop-up (get_captcha_download): {captcha_url}")
     return captcha_url, detalhes_url
 
-
 def extrair_html_modal(js: str) -> Optional[str]:
     m = re.search(r'\$\("#bloco_modal"\)\.html\((?P<q>[\'"])(.+?)(?P=q)\)', js, re.S)
     if m:
         raw = m.group(2)
-        html_modal = (
+        return (
             raw.replace("\\n", "\n")
                .replace("\\t", "\t")
                .replace('\\"', '"')
                .replace("\\/", "/")
         )
-        return html_modal
 
     if "<form" in js and "captcha_resposta" in js:
         return js
@@ -659,8 +623,7 @@ def extrair_html_modal(js: str) -> Optional[str]:
     print("❌ HTML do modal não encontrado.")
     return None
 
-
-def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, str], storage_path: str) -> bool:
+def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any], storage_path: str) -> bool:
     solicitacao_id = solicitacao_data["id"]
     print("\n⬇️ Iniciando download do ID", solicitacao_id)
 
@@ -671,19 +634,14 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, str],
 
     r_get = s.get(
         captcha_url,
-        headers={
-            "Referer": detalhes_url,
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "text/html,*/*",
-        },
+        headers={"Referer": detalhes_url, "X-Requested-With": "XMLHttpRequest", "Accept": "text/html,*/*"},
         timeout=30,
     )
     if r_get.status_code != 200:
         print("❌ Erro HTTP ao buscar get_captcha_download:", r_get.status_code)
         return False
 
-    js = r_get.text
-    html_modal = extrair_html_modal(js)
+    html_modal = extrair_html_modal(r_get.text)
     if not html_modal:
         return False
 
@@ -725,18 +683,21 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, str],
 
 
 # =========================================================
-# FLUXO POR EMPRESA (PERÍODO + TIPO + DOC) + NÃO DUPLICAR
+# FLUXO POR EMPRESA
+#   ✅ NÃO CONSIDERA ID COMO "CHAVE"
+#   ✅ CONSIDERA TIPO + PERÍODO (e DOC quando aparecer)
+#   ✅ BAIXA SOMENTE 1 SOLICITAÇÃO POR TIPO NO PERÍODO
 # =========================================================
 def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
     user = cert_row.get("user") or ""
     codi = cert_row.get("codi")
     venc = cert_row.get("vencimento")
-    doc = cert_row.get("cnpj/cpf") or ""
-    doc_alvo = somente_numeros(doc) or ""
+    doc_raw = cert_row.get("cnpj/cpf") or ""
+    doc_alvo = somente_numeros(doc_raw) or ""
 
     print("\n\n========================================================")
-    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc} | venc: {venc}")
+    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
     print("========================================================")
 
     try:
@@ -752,84 +713,98 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     periodo_alvo = periodo_mes_anterior_str()
     mes_cod = mes_anterior_codigo()
 
-    # Controla “já existe solicitação do mês anterior” POR TIPO para este doc
-    existe_por_tipo: Dict[str, bool] = {k: False for k in DFE_TYPES_MAP.keys()}
+    # 1) Filtra por PERÍODO + TIPO (+ DOC se detalhes trouxerem)
+    filtradas: List[Dict[str, Any]] = []
+    for item in solicitacoes:
+        solicitacao_id = item["id"]
+        estado = (item.get("estado") or "").upper()
 
-    if solicitacoes:
-        for item in solicitacoes:
-            solicitacao_id = item["id"]
-            estado = (item.get("estado") or "").upper()
+        tipo_norm = normalizar_tipo_documento(item.get("documento", ""))
+        if not tipo_norm or tipo_norm not in DFE_TYPES_MAP:
+            continue
 
-            tipo_norm = normalizar_tipo_documento(item.get("documento", ""))
-            if not tipo_norm or tipo_norm not in DFE_TYPES_MAP:
-                continue
+        det = extrair_detalhes_solicitacao(s, solicitacao_id)
+        periodo = (det.get("periodo") or "").strip()
+        doc_det = somente_numeros(det.get("doc")) if det.get("doc") else ""
 
-            det = extrair_detalhes_solicitacao(s, solicitacao_id)
-            periodo = (det.get("periodo") or "").strip()
-            doc_det = somente_numeros(det.get("doc")) if det.get("doc") else ""
+        if not periodo or periodo != periodo_alvo:
+            continue
 
-            # Filtro período
-            if not periodo or periodo != periodo_alvo:
-                continue
+        # Só compara doc se o detalhe retornou doc (muitos aparecem N/D no portal)
+        if doc_alvo and doc_det and doc_det != doc_alvo:
+            continue
 
-            # Filtro doc (só se o detalhe trouxer doc)
-            if doc_alvo and doc_det and doc_det != doc_alvo:
-                continue
+        filtradas.append({
+            **item,
+            "tipo_norm": tipo_norm,
+            "periodo": periodo,
+            "doc_det": doc_det,
+            "estado": estado,
+        })
 
-            existe_por_tipo[tipo_norm] = True
-            print(f"✔ Solicitação {solicitacao_id} | tipo: {tipo_norm} | período: {periodo} | estado: {estado} | doc(det): {doc_det or 'N/D'}")
+    # 2) Escolhe somente 1 por tipo (NFe/CTe/NFCe) no período
+    escolhidas = selecionar_uma_por_tipo(filtradas)
 
-            if estado == "DOWNLOAD":
-                base_name = item["file_name"]
-                nome_final = montar_nome_final_arquivo(
-                    base_name=base_name,
-                    empresa=empresa,
-                    user=user,
-                    codi=codi,
-                    mes_cod=mes_cod,
-                    doc=doc_alvo or doc,
-                )
-                storage_path = f"{PASTA_NOTAS}/{nome_final}"
-
-                # ✅ aqui é o ponto que estava causando duplicação: agora detecta certo mesmo com "@"
-                if arquivo_ja_existe_no_storage(storage_path):
-                    print(f"   ⤵ Já existe no Supabase, não será baixado novamente: {storage_path}")
-                    continue
-
-                ok = False
-                tent = 0
-                while tent < 3 and not ok:
-                    ok = realizar_download_dfe(s, item, storage_path)
-                    tent += 1
-                    if not ok:
-                        print(f"   Tentativa {tent} falhou para ID {solicitacao_id}.")
-                        time.sleep(10)
-
-                if ok:
-                    print(f"   ✅ Download concluído para ID {solicitacao_id}.")
-                else:
-                    print(f"❌ Falha crítica ao baixar ID {solicitacao_id} depois de 3 tentativas.")
-            else:
-                print(f"   🔄 ID {solicitacao_id} ainda está em '{estado}'. Aguardando próxima varredura.")
-
-        # Abrir novas solicitações só para tipos faltantes
-        faltando = [k for k, v in existe_por_tipo.items() if not v]
-        if not faltando:
-            print("\n✅ Já existe solicitação do MÊS ANTERIOR para ESTE DOC em TODOS os tipos (NFe/CTe/NFCe).")
-            print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
-        else:
-            print("\n⚠️ Estão faltando solicitações do mês anterior para este DOC nos tipos:", ", ".join(faltando))
-            print("➡️ Abrindo novas solicitações SOMENTE para os tipos faltantes...")
-            enviar_solicitacao_sequencial(s, apenas_tipos=faltando)
-
+    # 3) Log (o que foi escolhido)
+    if not escolhidas:
+        print("⚠️ Nenhuma solicitação encontrada para o período alvo (mês anterior).")
     else:
-        print("\n⚠️ Nenhuma solicitação encontrada na lista.")
-        print("➡️ Abrindo novas solicitações para o mês anterior...")
-        enviar_solicitacao_sequencial(s)
+        for tipo, it in escolhidas.items():
+            print(f"⭐ Escolhida para {tipo}: ID {it['id']} | estado: {it['estado']} | período: {it['periodo']} | doc(det): {it.get('doc_det') or 'N/D'}")
+
+    # 4) Baixa só as escolhidas que estiverem em DOWNLOAD
+    for tipo in ["CTe", "NFCe", "NFe"]:
+        it = escolhidas.get(tipo)
+        if not it:
+            continue
+
+        if it["estado"] != "DOWNLOAD":
+            print(f"   🔄 {tipo}: escolhida ID {it['id']} ainda está em '{it['estado']}'. Não baixa agora.")
+            continue
+
+        base_name = it["file_name"]
+        nome_final = montar_nome_final_arquivo(
+            base_name=base_name,
+            empresa=empresa,
+            user=user,
+            codi=codi,
+            mes_cod=mes_cod,
+            doc=doc_alvo or doc_raw,
+        )
+        storage_path = f"{PASTA_NOTAS}/{nome_final}"
+
+        # ✅ checagem por LIST (não cai em 400 de HEAD)
+        if arquivo_ja_existe_no_storage(storage_path):
+            print(f"   ⤵ {tipo}: já existe no Supabase, não baixa: {storage_path}")
+            continue
+
+        ok = False
+        tent = 0
+        while tent < 3 and not ok:
+            ok = realizar_download_dfe(s, it, storage_path)
+            tent += 1
+            if not ok:
+                print(f"   {tipo}: Tentativa {tent} falhou para ID {it['id']}.")
+                time.sleep(10)
+
+        if ok:
+            print(f"   ✅ {tipo}: Download concluído (ID {it['id']}).")
+        else:
+            print(f"❌ {tipo}: Falha crítica ao baixar ID {it['id']} depois de 3 tentativas.")
+
+    # 5) Abrir solicitações faltantes: se não existe NFe/CTe/NFCe nesse período, abre só os que faltam
+    faltando = [t for t in DFE_TYPES_MAP.keys() if t not in escolhidas]
+    if not faltando:
+        print("\n✅ Já existe solicitação do MÊS ANTERIOR para TODOS os tipos (considerando TIPO+PERÍODO).")
+        print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
+    else:
+        print("\n⚠️ Faltam solicitações do mês anterior nos tipos:", ", ".join(faltando))
+        print("➡️ Abrindo novas solicitações SOMENTE para os tipos faltantes...")
+        enviar_solicitacao_sequencial(s, apenas_tipos=faltando)
 
 
 # =========================================================
-# MAIN: PROCESSA TODAS AS EMPRESAS DA certifica_dfe EM LOOP
+# MAIN
 # =========================================================
 def processar_todas_empresas():
     certs = carregar_certificados_validos()
