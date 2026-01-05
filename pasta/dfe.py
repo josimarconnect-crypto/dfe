@@ -19,6 +19,7 @@ TABELA_CERTS = "certifica_dfe"
 BUCKET_IMAGENS = "imagens"
 PASTA_NOTAS = "notas"  # subpasta dentro do bucket
 
+
 def supabase_headers(is_json: bool = False) -> Dict[str, str]:
     h = {
         "apikey": SUPABASE_KEY,
@@ -37,12 +38,12 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 ANTI_CAPTCHA_KEY = "60ce5191cf427863d4f3c79ee20e4afe"
 
 # URLs gerais
-URL_HOME  = "https://dfe.sefin.ro.gov.br/"
-URL_BASE  = "https://download.dfe.sefin.ro.gov.br"
-URL_NOVO  = URL_BASE + "/solicitacoes/novo"
-URL_SOLICITACOES       = URL_BASE + "/solicitacoes"
-URL_DETALHES_TEMPLATE  = URL_BASE + "/solicitacoes/detalhes/{id}"
-URL_CREATE_BASE        = URL_BASE
+URL_HOME = "https://dfe.sefin.ro.gov.br/"
+URL_BASE = "https://download.dfe.sefin.ro.gov.br"
+URL_NOVO = URL_BASE + "/solicitacoes/novo"
+URL_SOLICITACOES = URL_BASE + "/solicitacoes"
+URL_DETALHES_TEMPLATE = URL_BASE + "/solicitacoes/detalhes/{id}"
+URL_CREATE_BASE = URL_BASE
 
 # Tipos DFe
 DFE_TYPES_MAP = {
@@ -63,6 +64,7 @@ INTERVALO_LOOP_SEGUNDOS = 36
 # FUSO HORÁRIO (RONDÔNIA)
 # =========================================================
 FUSO_RO = ZoneInfo("America/Porto_Velho")
+
 
 def hoje_ro() -> date:
     """
@@ -97,6 +99,40 @@ def mes_anterior_codigo() -> str:
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
     return fim_mes_anterior.strftime("%Y%m")
+
+
+def normalizar_tipo_documento(texto: str) -> Optional[str]:
+    """
+    Normaliza o texto da coluna 'DOCUMENTO' da listagem para um dos:
+      'NFe', 'CTe', 'NFCe'
+    """
+    if not texto:
+        return None
+    t = texto.strip().upper()
+
+    # remove espaços duplicados
+    t = re.sub(r"\s+", " ", t)
+
+    # casos comuns
+    if "CT" in t and "E" in t and ("CTE" in t or "CT-E" in t or "CT E" in t or "CONHECIMENTO" in t):
+        return "CTe"
+    if "NFC" in t and ("NFCE" in t or "NFC-E" in t or "NFC E" in t or "CONSUMIDOR" in t):
+        return "NFCe"
+    if "NF" in t and ("NFE" in t or "NF-E" in t or "NF E" in t or "NOTA FISCAL" in t):
+        # cuidado: não confundir NFCe
+        if "NFC" in t:
+            return "NFCe"
+        return "NFe"
+
+    # fallback por substring
+    if "CTE" in t:
+        return "CTe"
+    if "NFCE" in t:
+        return "NFCe"
+    if "NFE" in t:
+        return "NFe"
+
+    return None
 
 
 # =========================================================
@@ -200,16 +236,13 @@ def montar_nome_final_arquivo(
 
     Padrão:
       AAAAMM-<codi>-<doc>-<email>-<base_name>
-
-    Ex:
-      202510-15-12345678000199-teste@gmail.com-NFE_17448627.zip
     """
     doc_clean = somente_numeros(doc)
     if not doc_clean:
         doc_clean = "sem-doc"
 
     cod_str = str(codi) if codi is not None else "0"
-    email = user or "sem-user"   # e-mail “cru” mesmo, sem slug
+    email = user or "sem-user"  # e-mail “cru” mesmo, sem slug
 
     return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
 
@@ -237,11 +270,6 @@ def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
         "Connection": "keep-alive",
     })
     return s
-
-
-def get_current_month_str() -> str:
-    """Retorna o mês/ano atual (MM/YYYY) considerando o fuso de Rondônia."""
-    return hoje_ro().strftime("%m/%Y")
 
 
 def mes_anterior() -> Tuple[str, str]:
@@ -325,7 +353,7 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
 
 
 # =========================================================
-# PARTE 1 — CRIAR SOLICITAÇÕES (NFe, CTe, NFCe) DO MÊS ANTERIOR
+# PARTE 1 — CRIAR SOLICITAÇÕES (por tipo) DO MÊS ANTERIOR
 # =========================================================
 def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -456,9 +484,22 @@ def enviar_solicitacao_unica(
     return success
 
 
-def enviar_solicitacao_sequencial(s: requests.Session):
+def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[List[str]] = None):
+    """
+    Se 'apenas_tipos' for informado, abre solicitações somente para estes tipos:
+      ['NFe','CTe','NFCe']
+    """
+    if apenas_tipos is None:
+        tipos = list(DFE_TYPES_MAP.items())
+    else:
+        tipos = [(k, DFE_TYPES_MAP[k]) for k in apenas_tipos if k in DFE_TYPES_MAP]
+
     print("\n=== INICIANDO ABERTURA DE NOVAS SOLICITAÇÕES (MÊS ANTERIOR) ===")
-    for dfe_name, dfe_type_code in DFE_TYPES_MAP.items():
+    if not tipos:
+        print("   ⚠️ Nenhum tipo para solicitar.")
+        return
+
+    for dfe_name, dfe_type_code in tipos:
         tentativas = 0
         success = False
 
@@ -484,7 +525,7 @@ def enviar_solicitacao_sequencial(s: requests.Session):
 def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
     """
     Lista TODAS as solicitações (independente de estado),
-    para depois filtrar por período e estado no fluxo.
+    para depois filtrar por período + tipo + doc no fluxo.
     """
     print("🔎 Acessando lista de solicitações...")
     r = s.get(URL_SOLICITACOES, timeout=30)
@@ -510,7 +551,6 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
         return []
 
     itens: List[Dict[str, str]] = []
-
     rows = tabela.find("tbody").find_all("tr") if tabela.find("tbody") else tabela.find_all("tr")[1:]
 
     for row in rows:
@@ -532,7 +572,7 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
         if solicitacao_id:
             itens.append({
                 "id": solicitacao_id,
-                "documento": tipo_documento,
+                "documento": tipo_documento,  # texto da tabela
                 "estado": estado,
                 "data": data_full,
                 "file_name": f"{tipo_documento}_{solicitacao_id}.zip".replace(" ", "_").replace("/", "-"),
@@ -542,32 +582,42 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
     return itens
 
 
-def obter_periodo_da_solicitacao(s: requests.Session, solicitacao_id: str) -> Optional[str]:
-    """Lê a página de detalhes e extrai o período (linha PERÍODO:)."""
+def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Dict[str, Optional[str]]:
+    """
+    Abre detalhes e tenta extrair:
+      - periodo (PERÍODO)
+      - doc (CNPJ/CPF)
+    """
     url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
     r = s.get(url, timeout=30)
     if r.status_code != 200:
         print(f"   ❌ Erro ao abrir Detalhes {solicitacao_id}: {r.status_code}")
-        return None
+        return {"periodo": None, "doc": None}
 
     soup = BeautifulSoup(r.text, "lxml")
     tabela = soup.find("table", class_=re.compile("table-xxs"))
     if not tabela:
         print(f"   ❌ Tabela de detalhes não encontrada em {solicitacao_id}.")
-        return None
+        return {"periodo": None, "doc": None}
 
     periodo = None
+    doc = None
+
     for tr in tabela.find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) >= 2 and "PERÍODO" in tds[0].get_text(strip=True).upper():
-            periodo = tds[1].get_text(strip=True)
-            break
+        if len(tds) < 2:
+            continue
+        k = tds[0].get_text(strip=True).upper()
+        v = tds[1].get_text(strip=True)
 
-    if not periodo:
-        print(f"   ⚠️ Não foi possível identificar o período para a solicitação {solicitacao_id}.")
-    else:
-        print(f"   ✔ Período extraído ({solicitacao_id}): {periodo}")
-    return periodo
+        if "PERÍODO" in k:
+            periodo = v
+
+        # tenta achar algo como CNPJ/CPF, CPF/CNPJ, CNPJ, CPF
+        if ("CNPJ" in k) or ("CPF" in k):
+            doc = somente_numeros(v) or doc
+
+    return {"periodo": periodo, "doc": doc}
 
 
 def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tuple[str, str]]:
@@ -682,7 +732,6 @@ def realizar_download_dfe(
     }
 
     r_final = s.get(action, params=params, stream=True, timeout=120)
-
     content_type = (r_final.headers.get("Content-Type") or "").lower()
 
     if "application/zip" in content_type or "application/octet-stream" in content_type:
@@ -699,17 +748,18 @@ def realizar_download_dfe(
 
 
 # =========================================================
-# FLUXO POR EMPRESA (CERTIFICADO) — AJUSTADO
+# FLUXO POR EMPRESA (CERTIFICADO) — AJUSTADO (PERÍODO + TIPO + DOC)
 # =========================================================
 def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
     user = cert_row.get("user") or ""
     codi = cert_row.get("codi")
     venc = cert_row.get("vencimento")
-    doc = cert_row.get("cnpj/cpf") or ""   # CNPJ/CPF da tabela
+    doc_raw = cert_row.get("cnpj/cpf") or ""   # CNPJ/CPF da tabela
+    doc_alvo = somente_numeros(doc_raw) or ""
 
     print("\n\n========================================================")
-    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc} | venc: {venc}")
+    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
     print("========================================================")
 
     try:
@@ -722,75 +772,93 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     print("\n--- INICIANDO VERIFICAÇÃO / SOLICITAÇÕES / DOWNLOADS ---")
     solicitacoes = listar_solicitacoes(s)
 
-    periodo_mes_ant = periodo_mes_anterior_str()
+    periodo_alvo = periodo_mes_anterior_str()
     mes_cod = mes_anterior_codigo()
 
-    existe_solicitacao_mes_anterior = False
+    # controla “já existe solicitação do mês anterior” POR TIPO (NFe/CTe/NFCe) e para ESTE doc
+    existe_por_tipo: Dict[str, bool] = {k: False for k in DFE_TYPES_MAP.keys()}
 
     if solicitacoes:
         for item in solicitacoes:
             solicitacao_id = item["id"]
-            estado = item.get("estado", "").upper()
+            estado = (item.get("estado") or "").upper()
 
-            periodo = obter_periodo_da_solicitacao(s, solicitacao_id)
+            # 1) Normaliza o tipo do DFe da linha (documento)
+            tipo_norm = normalizar_tipo_documento(item.get("documento", ""))
+            if not tipo_norm or tipo_norm not in DFE_TYPES_MAP:
+                # não é um dos tipos que queremos controlar
+                continue
+
+            # 2) Busca detalhes UMA vez e extrai periodo + doc
+            det = extrair_detalhes_solicitacao(s, solicitacao_id)
+            periodo = (det.get("periodo") or "").strip()
+            doc_det = somente_numeros(det.get("doc")) if det.get("doc") else ""
+
             if not periodo:
                 print(f"   ⛔ Período não identificado para ID {solicitacao_id}. Ignorando.")
                 continue
 
-            periodo_ok = (periodo.strip() == periodo_mes_ant)
+            # 3) Filtros: PERÍODO + DOC (CNPJ/CPF) + TIPO
+            if periodo != periodo_alvo:
+                # print controlado para não poluir demais:
+                # print(f"   ⛔ ID {solicitacao_id}: período diferente ({periodo})")
+                continue
 
-            if periodo_ok:
-                existe_solicitacao_mes_anterior = True
-                print(f"✔ Solicitação {solicitacao_id} é do MÊS ANTERIOR | estado: {estado}")
+            if doc_alvo and doc_det and doc_det != doc_alvo:
+                # Se o site realmente informa doc nos detalhes, garantimos que é o mesmo da empresa.
+                continue
 
-                # Se já está em DOWNLOAD → tentar baixar
-                if estado == "DOWNLOAD":
-                    base_name = item["file_name"]   # ex: NFE_17448627.zip
-                    nome_final = montar_nome_final_arquivo(
-                        base_name=base_name,
-                        empresa=empresa,
-                        user=user,
-                        codi=codi,
-                        mes_cod=mes_cod,
-                        doc=doc,
-                    )
-                    storage_path = f"{PASTA_NOTAS}/{nome_final}"  # notas/<arquivo.zip>
+            # Passou: é do mês anterior, do tipo correto, e do doc correto.
+            existe_por_tipo[tipo_norm] = True
+            print(f"✔ Solicitação {solicitacao_id} | tipo: {tipo_norm} | período: {periodo} | estado: {estado} | doc(det): {doc_det or 'N/D'}")
 
-                    if arquivo_ja_existe_no_storage(storage_path):
-                        print(f"   ⤵ Já existe no Supabase, não será baixado novamente: {storage_path}")
-                        continue
+            # 4) Download só quando estiver em DOWNLOAD
+            if estado == "DOWNLOAD":
+                base_name = item["file_name"]  # ex: NFE_17448627.zip
+                nome_final = montar_nome_final_arquivo(
+                    base_name=base_name,
+                    empresa=empresa,
+                    user=user,
+                    codi=codi,
+                    mes_cod=mes_cod,
+                    doc=doc_alvo or doc_raw,
+                )
+                storage_path = f"{PASTA_NOTAS}/{nome_final}"  # notas/<arquivo.zip>
 
-                    ok = False
-                    tent = 0
-                    while tent < 3 and not ok:
-                        ok = realizar_download_dfe(s, item, storage_path)
-                        tent += 1
-                        if not ok:
-                            print(f"   Tentativa {tent} falhou para ID {solicitacao_id}.")
-                            time.sleep(10)
+                if arquivo_ja_existe_no_storage(storage_path):
+                    print(f"   ⤵ Já existe no Supabase, não será baixado novamente: {storage_path}")
+                    continue
 
-                    if ok:
-                        print(f"   ✅ Download concluído para ID {solicitacao_id}.")
-                    else:
-                        print(f"❌ Falha crítica ao baixar ID {solicitacao_id} depois de 3 tentativas.")
+                ok = False
+                tent = 0
+                while tent < 3 and not ok:
+                    ok = realizar_download_dfe(s, item, storage_path)
+                    tent += 1
+                    if not ok:
+                        print(f"   Tentativa {tent} falhou para ID {solicitacao_id}.")
+                        time.sleep(10)
+
+                if ok:
+                    print(f"   ✅ Download concluído para ID {solicitacao_id}.")
                 else:
-                    # Exemplo de estados: PROCESSANDO, GERANDO ARQUIVO(S), etc.
-                    print(f"   🔄 Solicitação {solicitacao_id} do mês anterior ainda está em estado '{estado}'. Aguardando próxima varredura.")
+                    print(f"❌ Falha crítica ao baixar ID {solicitacao_id} depois de 3 tentativas.")
             else:
-                print(f"   ⛔ Solicitação {solicitacao_id} tem período {periodo}, diferente do mês anterior ({periodo_mes_ant}). Ignorando.")
+                print(f"   🔄 ID {solicitacao_id} ainda está em '{estado}'. Aguardando próxima varredura.")
 
-        # Decisão de abrir ou não novas solicitações
-        if existe_solicitacao_mes_anterior:
-            print("\n✅ Já existe pelo menos uma solicitação para o MÊS ANTERIOR (em qualquer estado).")
-            print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
+        # 5) Decisão de abrir novas solicitações: agora é POR TIPO + PERÍODO + DOC
+        faltando = [k for k, v in existe_por_tipo.items() if not v]
+
+        if not faltando:
+            print("\n✅ Já existe solicitação do MÊS ANTERIOR para ESTE DOC em TODOS os tipos (NFe/CTe/NFCe).")
+            print("   ❌ Não será aberta nova solicitação agora (evita duplicar).")
         else:
-            print("\n⚠️ NÃO existe nenhuma solicitação com PERÍODO do mês anterior.")
-            print("➡️ Abrindo novas solicitações para o mês anterior...")
-            enviar_solicitacao_sequencial(s)
+            print("\n⚠️ Estão faltando solicitações do mês anterior para este DOC nos tipos:", ", ".join(faltando))
+            print("➡️ Abrindo novas solicitações SOMENTE para os tipos faltantes...")
+            enviar_solicitacao_sequencial(s, apenas_tipos=faltando)
 
     else:
         print("\n⚠️ Nenhuma solicitação encontrada na lista.")
-        print("➡️ Abrindo novas solicitações para o mês anterior...")
+        print("➡️ Abrindo novas solicitações para o mês anterior (todos os tipos)...")
         enviar_solicitacao_sequencial(s)
 
 
