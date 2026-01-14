@@ -110,13 +110,44 @@ def normalizar_tipo_documento(texto: str) -> Optional[str]:
         return "NFe"
     return None
 
+def norm_text(v: Any) -> str:
+    if v is None:
+        return ""
+    return re.sub(r"\s+", " ", str(v).strip())
+
+def fazer_esta_nao(v: Any) -> bool:
+    """
+    Retorna True se a coluna 'fazer' estiver como 'nao' (case-insensitive).
+    Aceita variações com espaços.
+    """
+    t = norm_text(v).lower()
+    return t == "nao"
+
+def is_vencido(venc: Any) -> bool:
+    """
+    Vencimento vem como 'YYYY-MM-DD' (string) pelo REST do Supabase.
+    Considera vencido se vencimento < hoje_ro().
+    Se vencimento estiver vazio/nulo, considera NÃO vencido (você pode mudar se preferir).
+    """
+    if not venc:
+        return False
+    try:
+        s = str(venc)[:10]
+        y, m, d = s.split("-")
+        vdate = date(int(y), int(m), int(d))
+        return vdate < hoje_ro()
+    except Exception:
+        # Se vier algo fora do esperado, não trava o fluxo
+        return False
+
 
 # =========================================================
 # SUPABASE: CERTIFICADOS
 # =========================================================
 def carregar_certificados_validos() -> List[Dict[str, Any]]:
     url = f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}"
-    params = {"select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf"'}
+    # ✅ inclui 'fazer' para poder pular quando for "nao"
+    params = {"select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf",fazer'}
     print("🔎 Buscando certificados na tabela certifica_dfe (REST Supabase)...")
     r = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
     r.raise_for_status()
@@ -798,7 +829,7 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         print("\n✅ Já existe solicitação do MÊS ANTERIOR para TODOS os tipos (considerando TIPO+PERÍODO).")
         print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
     else:
-        print("\n⚠️ Faltam solicitações do mês anterior nos tipos:", ", ".join(faltando))
+        print("\n⚠️ Faltam solicitaitações do mês anterior nos tipos:", ", ".join(faltando))
         print("➡️ Abrindo novas solicitações SOMENTE para os tipos faltantes...")
         enviar_solicitacao_sequencial(s, apenas_tipos=faltando)
 
@@ -812,11 +843,28 @@ def processar_todas_empresas():
         print("⚠️ Nenhum certificado encontrado na tabela certifica_dfe.")
         return
 
+    hoje = hoje_ro()
+
     for cert_row in certs:
+        empresa = cert_row.get("empresa") or "(sem empresa)"
+        user = cert_row.get("user") or ""
+        venc = cert_row.get("vencimento")
+        fazer = cert_row.get("fazer")
+
+        # ✅ REGRA 1: se fazer == "nao" -> NÃO processa
+        if fazer_esta_nao(fazer):
+            print(f"\n⏭️ PULANDO (fazer='nao'): {empresa} | user: {user}")
+            continue
+
+        # ✅ REGRA 2: se vencido -> NÃO processa
+        if is_vencido(venc):
+            print(f"\n⏭️ PULANDO (CERT VENCIDO): {empresa} | user: {user} | venc: {venc} | hoje: {hoje.isoformat()}")
+            continue
+
         try:
             fluxo_completo_para_empresa(cert_row)
         except Exception as e:
-            print(f"❌ Erro inesperado ao processar empresa {cert_row.get('empresa')}: {e}")
+            print(f"❌ Erro inesperado ao processar empresa {empresa}: {e}")
 
 
 if __name__ == "__main__":
