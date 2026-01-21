@@ -5,10 +5,15 @@ import re
 import os
 import base64
 import tempfile
+import socket
 from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo  # 👈 Fuso horário
+
+# Retry helpers
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # =========================================================
 # === CONFIGURAÇÕES SUPABASE (via REST) ===================
@@ -34,7 +39,8 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 # === CONFIGURAÇÕES GERAIS ================================
 # =========================================================
 
-ANTI_CAPTCHA_KEY = "60ce5191cf427863d4f3c79ee20e4afe"
+# Você pode manter aqui OU setar no Render (Environment -> ANTI_CAPTCHA_KEY)
+ANTI_CAPTCHA_KEY = os.getenv("ANTI_CAPTCHA_KEY", "60ce5191cf427863d4f3c79ee20e4afe").strip()
 
 URL_HOME  = "https://dfe.sefin.ro.gov.br/"
 URL_BASE  = "https://download.dfe.sefin.ro.gov.br"
@@ -62,6 +68,58 @@ FUSO_RO = ZoneInfo("America/Porto_Velho")
 
 def hoje_ro() -> date:
     return datetime.now(FUSO_RO).date()
+
+
+# =========================================================
+# PROXY (Render / Datacenter)
+# =========================================================
+def get_proxies() -> Optional[Dict[str, str]]:
+    """
+    Usa variáveis de ambiente padrão:
+      HTTP_PROXY / HTTPS_PROXY
+    No Render: Settings -> Environment
+    """
+    http_p = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_p = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+
+    proxies = {}
+    if http_p:
+        proxies["http"] = http_p
+    if https_p:
+        proxies["https"] = https_p
+
+    return proxies or None
+
+
+# =========================================================
+# DIAGNÓSTICO DE REDE (Anti-Captcha)
+# =========================================================
+def diagnostico_rede_anticaptcha():
+    """
+    Só para LOGAR e ajudar você a identificar se é:
+    - DNS
+    - Bloqueio/rota
+    - Lentidão
+    Não quebra o robô.
+    """
+    host = "api.anti-captcha.com"
+    proxies = get_proxies()
+
+    print("\n[DIAG] Anti-Captcha: iniciando diagnóstico rápido de rede...")
+    print(f"[DIAG] Usando proxies? {'SIM' if proxies else 'NÃO'}")
+
+    try:
+        ip = socket.gethostbyname(host)
+        print(f"[DIAG] DNS OK: {host} -> {ip}")
+    except Exception as e:
+        print(f"[DIAG] DNS FALHOU para {host}: {e}")
+        return
+
+    try:
+        r = requests.get(f"https://{host}", timeout=(15, 20), proxies=proxies)
+        print(f"[DIAG] GET https://{host} -> status {r.status_code}")
+    except Exception as e:
+        print(f"[DIAG] GET https://{host} falhou/timeout: {e}")
 
 
 # =========================================================
@@ -127,7 +185,7 @@ def is_vencido(venc: Any) -> bool:
     """
     Vencimento vem como 'YYYY-MM-DD' (string) pelo REST do Supabase.
     Considera vencido se vencimento < hoje_ro().
-    Se vencimento estiver vazio/nulo, considera NÃO vencido (você pode mudar se preferir).
+    Se vencimento estiver vazio/nulo, considera NÃO vencido.
     """
     if not venc:
         return False
@@ -137,7 +195,6 @@ def is_vencido(venc: Any) -> bool:
         vdate = date(int(y), int(m), int(d))
         return vdate < hoje_ro()
     except Exception:
-        # Se vier algo fora do esperado, não trava o fluxo
         return False
 
 
@@ -146,7 +203,6 @@ def is_vencido(venc: Any) -> bool:
 # =========================================================
 def carregar_certificados_validos() -> List[Dict[str, Any]]:
     url = f"{SUPABASE_URL}/rest/v1/{TABELA_CERTS}"
-    # ✅ inclui 'fazer' para poder pular quando for "nao"
     params = {"select": 'id,pem,key,empresa,codi,user,vencimento,"cnpj/cpf",fazer'}
     print("🔎 Buscando certificados na tabela certifica_dfe (REST Supabase)...")
     r = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
@@ -176,14 +232,9 @@ def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
 # SUPABASE: STORAGE (CHECAGEM POR LIST = ROBUSTA)
 # =========================================================
 def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
-    """
-    ✅ Checagem robusta via LIST:
-      POST /storage/v1/object/list/{bucket}
-    Não depende de HEAD no objeto (que estava retornando 400 em alguns casos).
-    """
     storage_path = storage_path.lstrip("/")
-    pasta = os.path.dirname(storage_path).replace("\\", "/")  # ex: "notas"
-    arquivo = os.path.basename(storage_path)                  # ex: "...-NFE_123.zip"
+    pasta = os.path.dirname(storage_path).replace("\\", "/")
+    arquivo = os.path.basename(storage_path)
 
     url = f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET_IMAGENS}"
     headers = supabase_headers(is_json=True)
@@ -216,10 +267,6 @@ def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
 
 
 def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = "application/zip") -> bool:
-    """
-    Upload via REST:
-      POST /storage/v1/object/{bucket}/{path}
-    """
     storage_path = storage_path.lstrip("/")
     url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_IMAGENS}/{storage_path}"
     headers = supabase_headers()
@@ -247,7 +294,7 @@ def montar_nome_final_arquivo(
 ) -> str:
     doc_clean = somente_numeros(doc) or "sem-doc"
     cod_str = str(codi) if codi is not None else "0"
-    email = user or "sem-user"  # mantém e-mail cru
+    email = user or "sem-user"
     return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
 
 
@@ -273,17 +320,32 @@ def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
 
 
 # =========================================================
-# ANTI-CAPTCHA
+# ANTI-CAPTCHA (ROBUSTO PARA RENDER)
 # =========================================================
+_ANTI_SESSION = requests.Session()
+_retries = Retry(
+    total=5,
+    connect=5,
+    read=5,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=frozenset(["POST"]),
+    raise_on_status=False,
+)
+_ANTI_SESSION.mount("https://", HTTPAdapter(max_retries=_retries))
+
+
 def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
     if not ANTI_CAPTCHA_KEY:
-        print("⚠️ ANTI_CAPTCHA_KEY está vazia. Usando modo manual.")
+        print("⚠️ ANTI_CAPTCHA_KEY vazia. Usando modo manual.")
         return None
+
+    proxies = get_proxies()
 
     print("🤖 Tentando Anti-Captcha API...")
     start_time = time.time()
 
-    payload: Dict[str, Any] = {
+    create_payload: Dict[str, Any] = {
         "clientKey": ANTI_CAPTCHA_KEY,
         "task": {
             "type": "ImageToTextTask",
@@ -294,40 +356,68 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
         },
     }
 
+    # Render costuma precisar de timeouts maiores
+    CONNECT_TIMEOUT = 45
+    READ_TIMEOUT = 120
+
     try:
-        r = requests.post("https://api.anti-captcha.com/createTask", json=payload, timeout=20)
+        r = _ANTI_SESSION.post(
+            "https://api.anti-captcha.com/createTask",
+            json=create_payload,
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            proxies=proxies,
+        )
         r.raise_for_status()
         resp = r.json()
+
         task_id = resp.get("taskId")
         if not task_id:
-            print("❌ Erro ao criar task no Anti-Captcha:", resp)
+            print("❌ Anti-Captcha createTask sem taskId:", resp)
             return None
 
-        for _ in range(5):
+        max_polls = 14  # ~ 14*3s = 42s
+        for i in range(max_polls):
             time.sleep(3)
-            r = requests.post(
-                "https://api.anti-captcha.com/getTaskResult",
-                json={"clientKey": ANTI_CAPTCHA_KEY, "taskId": task_id},
-                timeout=20,
-            )
-            r.raise_for_status()
-            result = r.json()
+            try:
+                r2 = _ANTI_SESSION.post(
+                    "https://api.anti-captcha.com/getTaskResult",
+                    json={"clientKey": ANTI_CAPTCHA_KEY, "taskId": task_id},
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                    proxies=proxies,
+                )
+                r2.raise_for_status()
+                result = r2.json()
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Falha no polling Anti-Captcha ({i+1}/{max_polls}): {e}")
+                continue
+
             status = result.get("status")
-
             if status == "ready":
-                text = result["solution"]["text"]
-                print(f"✅ Anti-Captcha resolveu em {time.time() - start_time:.1f}s: {text}")
-                return text
-
-            if status != "processing":
-                print("❌ Anti-CAPTCHA retornou erro:", result)
+                text = (result.get("solution") or {}).get("text")
+                if text:
+                    print(f"✅ Anti-Captcha resolveu em {time.time() - start_time:.1f}s: {text}")
+                    return text
+                print("❌ Anti-Captcha 'ready' mas sem texto:", result)
                 return None
 
-        print("❌ Anti-Captcha não conseguiu resolver a tempo (Timeout).")
+            if status not in ("processing", None):
+                print("❌ Anti-Captcha retornou erro:", result)
+                return None
+
+        print("❌ Anti-Captcha não resolveu a tempo (timeout de polling).")
         return None
 
+    except requests.exceptions.ConnectTimeout:
+        print("❌ Anti-Captcha: timeout de CONEXÃO (Render/rota/bloqueio). Indo para modo manual.")
+        return None
+    except requests.exceptions.ReadTimeout:
+        print("❌ Anti-Captcha: timeout de RESPOSTA (servidor lento). Indo para modo manual.")
+        return None
+    except requests.exceptions.RequestException as e:
+        print("❌ Anti-Captcha: erro HTTP/rede:", e)
+        return None
     except Exception as e:
-        print("❌ Erro de conexão/API com Anti-Captcha:", e)
+        print("❌ Anti-Captcha: erro inesperado:", e)
         return None
 
 
@@ -390,12 +480,11 @@ def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: 
     captcha_resposta: Optional[str] = resolver_captcha_anticaptcha(b64_captcha)
     if not captcha_resposta:
         print("\n====================================================================")
-        print("🛑 MODO MANUAL: Resolução automática falhou ou não configurada.")
+        print("🛑 MODO MANUAL: Resolução automática falhou ou indisponível no Render.")
         print("====================================================================")
-        captcha_resposta = input(f"Digite o CAPTCHA para {dfe_name}: ").strip()
-        if not captcha_resposta:
-            print("❌ Nenhuma resposta de CAPTCHA fornecida. Abortando POST.")
-            return False
+        # No Render não tem input() prático; então aborta com False.
+        print("❌ Sem captcha automático e sem entrada manual. Abortando esta solicitação.")
+        return False
 
     data_ini, data_fim = mes_anterior()
 
@@ -448,9 +537,6 @@ def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: 
 
 
 def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[List[str]] = None):
-    """
-    Se apenas_tipos for informado (ex: ['NFe','CTe']), solicita só esses.
-    """
     tipos = list(DFE_TYPES_MAP.items()) if apenas_tipos is None else [(t, DFE_TYPES_MAP[t]) for t in apenas_tipos if t in DFE_TYPES_MAP]
 
     print("\n=== INICIANDO ABERTURA DE NOVAS SOLICITAÇÕES (MÊS ANTERIOR) ===")
@@ -574,9 +660,6 @@ def _parse_id_num(solicitacao_id: str) -> int:
         return 0
 
 def _peso_estado(estado: str) -> int:
-    """
-    Quanto maior, mais 'pronto'. Ajuste se aparecerem novos nomes.
-    """
     e = (estado or "").upper()
     if "DOWNLOAD" in e:
         return 100
@@ -591,11 +674,6 @@ def _peso_estado(estado: str) -> int:
     return 30
 
 def selecionar_uma_por_tipo(solicitacoes_filtradas: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Escolhe somente 1 por tipo, preferindo:
-      1) maior peso de estado (DOWNLOAD > GERANDO > PROCESSANDO > ...)
-      2) maior ID (mais recente) como desempate
-    """
     melhor: Dict[str, Dict[str, Any]] = {}
     for it in solicitacoes_filtradas:
         tipo = it.get("tipo_norm")
@@ -694,11 +772,8 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any],
 
     captcha = resolver_captcha_anticaptcha(b64)
     if not captcha:
-        print("🛑 Resolução automática falhou. Modo manual.")
-        captcha = input("Digite o CAPTCHA: ").strip()
-        if not captcha:
-            print("❌ Nenhuma resposta de CAPTCHA fornecida.")
-            return False
+        print("❌ Sem captcha automático no Render. Abortando download deste ID.")
+        return False
 
     print("3️⃣ Enviando GET final para baixar o ZIP...")
     params = {"token": token, "captcha_resposta": captcha}
@@ -715,9 +790,6 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any],
 
 # =========================================================
 # FLUXO POR EMPRESA
-#   ✅ NÃO CONSIDERA ID COMO "CHAVE"
-#   ✅ CONSIDERA TIPO + PERÍODO (e DOC quando aparecer)
-#   ✅ BAIXA SOMENTE 1 SOLICITAÇÃO POR TIPO NO PERÍODO
 # =========================================================
 def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
@@ -744,7 +816,6 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     periodo_alvo = periodo_mes_anterior_str()
     mes_cod = mes_anterior_codigo()
 
-    # 1) Filtra por PERÍODO + TIPO (+ DOC se detalhes trouxerem)
     filtradas: List[Dict[str, Any]] = []
     for item in solicitacoes:
         solicitacao_id = item["id"]
@@ -761,7 +832,6 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         if not periodo or periodo != periodo_alvo:
             continue
 
-        # Só compara doc se o detalhe retornou doc (muitos aparecem N/D no portal)
         if doc_alvo and doc_det and doc_det != doc_alvo:
             continue
 
@@ -773,17 +843,14 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
             "estado": estado,
         })
 
-    # 2) Escolhe somente 1 por tipo (NFe/CTe/NFCe) no período
     escolhidas = selecionar_uma_por_tipo(filtradas)
 
-    # 3) Log (o que foi escolhido)
     if not escolhidas:
         print("⚠️ Nenhuma solicitação encontrada para o período alvo (mês anterior).")
     else:
         for tipo, it in escolhidas.items():
             print(f"⭐ Escolhida para {tipo}: ID {it['id']} | estado: {it['estado']} | período: {it['periodo']} | doc(det): {it.get('doc_det') or 'N/D'}")
 
-    # 4) Baixa só as escolhidas que estiverem em DOWNLOAD
     for tipo in ["CTe", "NFCe", "NFe"]:
         it = escolhidas.get(tipo)
         if not it:
@@ -804,7 +871,6 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         )
         storage_path = f"{PASTA_NOTAS}/{nome_final}"
 
-        # ✅ checagem por LIST (não cai em 400 de HEAD)
         if arquivo_ja_existe_no_storage(storage_path):
             print(f"   ⤵ {tipo}: já existe no Supabase, não baixa: {storage_path}")
             continue
@@ -823,7 +889,6 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         else:
             print(f"❌ {tipo}: Falha crítica ao baixar ID {it['id']} depois de 3 tentativas.")
 
-    # 5) Abrir solicitações faltantes: se não existe NFe/CTe/NFCe nesse período, abre só os que faltam
     faltando = [t for t in DFE_TYPES_MAP.keys() if t not in escolhidas]
     if not faltando:
         print("\n✅ Já existe solicitação do MÊS ANTERIOR para TODOS os tipos (considerando TIPO+PERÍODO).")
@@ -851,12 +916,10 @@ def processar_todas_empresas():
         venc = cert_row.get("vencimento")
         fazer = cert_row.get("fazer")
 
-        # ✅ REGRA 1: se fazer == "nao" -> NÃO processa
         if fazer_esta_nao(fazer):
             print(f"\n⏭️ PULANDO (fazer='nao'): {empresa} | user: {user}")
             continue
 
-        # ✅ REGRA 2: se vencido -> NÃO processa
         if is_vencido(venc):
             print(f"\n⏭️ PULANDO (CERT VENCIDO): {empresa} | user: {user} | venc: {venc} | hoje: {hoje.isoformat()}")
             continue
@@ -868,6 +931,9 @@ def processar_todas_empresas():
 
 
 if __name__ == "__main__":
+    # diagnóstico só uma vez ao iniciar (pra você ver no log do Render)
+    diagnostico_rede_anticaptcha()
+
     while True:
         print("\n\n==================== NOVA VARREDURA GERAL ====================")
         print(f"📅 Data (fuso RO): {hoje_ro().strftime('%d/%m/%Y')}")
