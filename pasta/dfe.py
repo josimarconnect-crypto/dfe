@@ -1,29 +1,56 @@
 # -*- coding: utf-8 -*-
-import requests
-import time
-import re
+"""
+ROBÔ ÚNICO:
+- DF-e RO (SEFIN/RO download.dfe.sefin.ro.gov.br): solicita mês anterior + baixa ZIP quando pronto
+- NFS-e ADN (adn.nfse.gov.br): varre NSU, extrai XMLs do mês anterior, zipa e sobe pro Supabase
+
+Flags (Render -> Environment):
+  RUN_DFE=1   (default 1)
+  RUN_NFSE=1  (default 1)
+
+  ANTI_CAPTCHA_KEY=...
+  HTTP_PROXY / HTTPS_PROXY (opcional)
+
+  START_NSU=0
+  MAX_NSU=400
+  INTERVALO_LOOP_SEGUNDOS=900
+"""
+
 import os
+import re
+import time
+import json
 import base64
-import tempfile
+import gzip
 import socket
-from bs4 import BeautifulSoup
+import zipfile
+import tempfile
+import shutil
+import requests
+
 from datetime import date, timedelta, datetime
 from typing import Dict, Any, Optional, List, Tuple
-from zoneinfo import ZoneInfo  # 👈 Fuso horário
+from zoneinfo import ZoneInfo
 
-# Retry helpers
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# =========================================================
-# === CONFIGURAÇÕES SUPABASE (via REST) ===================
-# =========================================================
-SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+from bs4 import BeautifulSoup
+from lxml import etree
 
-TABELA_CERTS = "certifica_dfe"
-BUCKET_IMAGENS = "imagens"
-PASTA_NOTAS = "notas"  # subpasta dentro do bucket
+
+# =========================================================
+# === SUPABASE (via REST) =================================
+# =========================================================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co").strip()
+SUPABASE_KEY = os.getenv(
+    "SUPABASE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+).strip()
+
+TABELA_CERTS = os.getenv("TABELA_CERTS", "certifica_dfe").strip()
+BUCKET_IMAGENS = os.getenv("BUCKET_IMAGENS", "imagens").strip()
+PASTA_NOTAS = os.getenv("PASTA_NOTAS", "notas").strip()
 
 def supabase_headers(is_json: bool = False) -> Dict[str, str]:
     h = {
@@ -36,29 +63,14 @@ def supabase_headers(is_json: bool = False) -> Dict[str, str]:
 
 
 # =========================================================
-# === CONFIGURAÇÕES GERAIS ================================
+# === FLAGS / LOOP ========================================
 # =========================================================
+RUN_DFE  = (os.getenv("RUN_DFE", "1").strip() == "1")
+RUN_NFSE = (os.getenv("RUN_NFSE", "1").strip() == "1")
 
-# Você pode manter aqui OU setar no Render (Environment -> ANTI_CAPTCHA_KEY)
-ANTI_CAPTCHA_KEY = os.getenv("ANTI_CAPTCHA_KEY", "60ce5191cf427863d4f3c79ee20e4afe").strip()
-
-URL_HOME  = "https://dfe.sefin.ro.gov.br/"
-URL_BASE  = "https://download.dfe.sefin.ro.gov.br"
-URL_NOVO  = URL_BASE + "/solicitacoes/novo"
-URL_SOLICITACOES       = URL_BASE + "/solicitacoes"
-URL_DETALHES_TEMPLATE  = URL_BASE + "/solicitacoes/detalhes/{id}"
-URL_CREATE_BASE        = URL_BASE
-
-DFE_TYPES_MAP = {
-    "NFe": "0",
-    "CTe": "1",
-    "NFCe": "2",
-}
-
-TIPO_SOLICITACAO = "1"  # 1=PERIODO
-MAX_TENTATIVAS = 5
-DELAY_ENTRE_TENTATIVAS = 2
-INTERVALO_LOOP_SEGUNDOS = 36
+START_NSU_DEFAULT = int(os.getenv("START_NSU", "0") or "0")
+MAX_NSU_DEFAULT   = int(os.getenv("MAX_NSU", "400") or "400")
+INTERVALO_LOOP_SEGUNDOS = int(os.getenv("INTERVALO_LOOP_SEGUNDOS", "900") or "900")  # 15min default
 
 
 # =========================================================
@@ -69,74 +81,13 @@ FUSO_RO = ZoneInfo("America/Porto_Velho")
 def hoje_ro() -> date:
     return datetime.now(FUSO_RO).date()
 
-
-# =========================================================
-# PROXY (Render / Datacenter)
-# =========================================================
-def get_proxies() -> Optional[Dict[str, str]]:
-    """
-    Usa variáveis de ambiente padrão:
-      HTTP_PROXY / HTTPS_PROXY
-    No Render: Settings -> Environment
-    """
-    http_p = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    https_p = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-
-    proxies = {}
-    if http_p:
-        proxies["http"] = http_p
-    if https_p:
-        proxies["https"] = https_p
-
-    return proxies or None
-
-
-# =========================================================
-# DIAGNÓSTICO DE REDE (Anti-Captcha)
-# =========================================================
-def diagnostico_rede_anticaptcha():
-    """
-    Só para LOGAR e ajudar você a identificar se é:
-    - DNS
-    - Bloqueio/rota
-    - Lentidão
-    Não quebra o robô.
-    """
-    host = "api.anti-captcha.com"
-    proxies = get_proxies()
-
-    print("\n[DIAG] Anti-Captcha: iniciando diagnóstico rápido de rede...")
-    print(f"[DIAG] Usando proxies? {'SIM' if proxies else 'NÃO'}")
-
-    try:
-        ip = socket.gethostbyname(host)
-        print(f"[DIAG] DNS OK: {host} -> {ip}")
-    except Exception as e:
-        print(f"[DIAG] DNS FALHOU para {host}: {e}")
-        return
-
-    try:
-        r = requests.get(f"https://{host}", timeout=(15, 20), proxies=proxies)
-        print(f"[DIAG] GET https://{host} -> status {r.status_code}")
-    except Exception as e:
-        print(f"[DIAG] GET https://{host} falhou/timeout: {e}")
-
-
-# =========================================================
-# FUNÇÕES AUXILIARES
-# =========================================================
-def somente_numeros(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return re.sub(r"\D+", "", s)
-
 def mes_anterior_codigo() -> str:
     hoje = hoje_ro()
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
     return fim_mes_anterior.strftime("%Y%m")
 
-def mes_anterior() -> Tuple[str, str]:
+def mes_anterior_str_range() -> Tuple[str, str]:
     hoje = hoje_ro()
     inicio_mes_atual = hoje.replace(day=1)
     fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
@@ -147,26 +98,40 @@ def mes_anterior() -> Tuple[str, str]:
     )
 
 def periodo_mes_anterior_str() -> str:
-    ini, fim = mes_anterior()
+    ini, fim = mes_anterior_str_range()
     return f"{ini} a {fim}"
 
-def normalizar_tipo_documento(texto: str) -> Optional[str]:
-    """
-    Normaliza a coluna 'DOCUMENTO' da listagem para: NFe / CTe / NFCe
-    """
-    if not texto:
-        return None
-    t = re.sub(r"\s+", " ", texto.strip().upper())
+def mes_anterior_range_dt() -> Tuple[datetime, datetime]:
+    hoje = hoje_ro()
+    inicio_mes_atual = hoje.replace(day=1)
+    fim_mes_anterior = inicio_mes_atual - timedelta(days=1)
+    inicio_mes_anterior = fim_mes_anterior.replace(day=1)
+    data_ini_dt = datetime(inicio_mes_anterior.year, inicio_mes_anterior.month, inicio_mes_anterior.day, 0, 0, 0)
+    data_fim_dt = datetime(fim_mes_anterior.year, fim_mes_anterior.month, fim_mes_anterior.day, 23, 59, 59)
+    return data_ini_dt, data_fim_dt
 
-    if "CTE" in t or "CT-E" in t or "CONHECIMENTO" in t:
-        return "CTe"
-    if "NFCE" in t or "NFC-E" in t or "CONSUMIDOR" in t:
-        return "NFCe"
-    if "NFE" in t or "NF-E" in t or "NOTA FISCAL" in t:
-        if "NFC" in t:
-            return "NFCe"
-        return "NFe"
-    return None
+
+# =========================================================
+# PROXY (Render / Datacenter)
+# =========================================================
+def get_proxies() -> Optional[Dict[str, str]]:
+    http_p = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_p = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    proxies = {}
+    if http_p:
+        proxies["http"] = http_p
+    if https_p:
+        proxies["https"] = https_p
+    return proxies or None
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def somente_numeros(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\D+", "", str(s))
 
 def norm_text(v: Any) -> str:
     if v is None:
@@ -174,19 +139,9 @@ def norm_text(v: Any) -> str:
     return re.sub(r"\s+", " ", str(v).strip())
 
 def fazer_esta_nao(v: Any) -> bool:
-    """
-    Retorna True se a coluna 'fazer' estiver como 'nao' (case-insensitive).
-    Aceita variações com espaços.
-    """
-    t = norm_text(v).lower()
-    return t == "nao"
+    return norm_text(v).lower() == "nao"
 
 def is_vencido(venc: Any) -> bool:
-    """
-    Vencimento vem como 'YYYY-MM-DD' (string) pelo REST do Supabase.
-    Considera vencido se vencimento < hoje_ro().
-    Se vencimento estiver vazio/nulo, considera NÃO vencido.
-    """
     if not venc:
         return False
     try:
@@ -196,6 +151,18 @@ def is_vencido(venc: Any) -> bool:
         return vdate < hoje_ro()
     except Exception:
         return False
+
+def montar_nome_final_arquivo(
+    base_name: str,
+    user: str,
+    codi: Optional[int],
+    mes_cod: str,
+    doc: str,
+) -> str:
+    doc_clean = somente_numeros(doc) or "sem-doc"
+    cod_str = str(codi) if codi is not None else "0"
+    email = (user or "sem-user").replace("/", "_")
+    return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
 
 
 # =========================================================
@@ -211,25 +178,32 @@ def carregar_certificados_validos() -> List[Dict[str, Any]]:
     print(f"   ✔ {len(certs)} certificados encontrados.")
     return certs
 
-def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str]:
+def criar_arquivos_cert_temp(cert_row: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    Cria um diretório temporário e grava cert/key.
+    Retorna: (cert_path, key_path, tmp_dir)
+    """
     pem_b64 = cert_row.get("pem") or ""
     key_b64 = cert_row.get("key") or ""
 
     pem_bytes = base64.b64decode(pem_b64)
     key_bytes = base64.b64decode(key_b64)
 
-    cert_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
-    key_file  = tempfile.NamedTemporaryFile(delete=False, suffix=".key")
+    tmp_dir = tempfile.mkdtemp(prefix="cert_")
+    cert_path = os.path.join(tmp_dir, "cert.pem")
+    key_path  = os.path.join(tmp_dir, "key.pem")
 
-    cert_file.write(pem_bytes); cert_file.flush(); cert_file.close()
-    key_file.write(key_bytes);  key_file.flush();  key_file.close()
+    with open(cert_path, "wb") as f:
+        f.write(pem_bytes)
+    with open(key_path, "wb") as f:
+        f.write(key_bytes)
 
-    print(f"   ✔ Arquivos temporários de certificado criados: {cert_file.name}, {key_file.name}")
-    return cert_file.name, key_file.name
+    print(f"   ✔ Cert temporário: {cert_path}")
+    return cert_path, key_path, tmp_dir
 
 
 # =========================================================
-# SUPABASE: STORAGE (CHECAGEM POR LIST = ROBUSTA)
+# SUPABASE: STORAGE
 # =========================================================
 def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
     storage_path = storage_path.lstrip("/")
@@ -255,16 +229,13 @@ def arquivo_ja_existe_no_storage(storage_path: str) -> bool:
 
         itens = r.json() or []
         existe = any((i.get("name") == arquivo) for i in itens)
-
         if existe:
-            print(f"   ⚠️ Arquivo já existente no storage: {storage_path}")
-            return True
-        return False
+            print(f"   ⚠️ Já existe no storage: {storage_path}")
+        return existe
 
     except Exception as e:
         print(f"   ⚠️ Erro ao checar existência no storage (LIST) ({storage_path}): {e}")
         return False
-
 
 def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = "application/zip") -> bool:
     storage_path = storage_path.lstrip("/")
@@ -273,39 +244,75 @@ def upload_para_storage(storage_path: str, conteudo: bytes, content_type: str = 
     headers["Content-Type"] = content_type
 
     try:
-        r = requests.post(url, headers=headers, data=conteudo, timeout=120)
+        r = requests.post(url, headers=headers, data=conteudo, timeout=180)
         if r.status_code in (200, 201):
-            print(f"   🎉 Upload realizado para Supabase: {storage_path}")
+            print(f"   🎉 Upload OK: {storage_path}")
             return True
-        print(f"   ❌ Erro upload ({r.status_code}) {storage_path}: {r.text}")
+        print(f"   ❌ Upload erro ({r.status_code}) {storage_path}: {r.text[:400]}")
         return False
     except Exception as e:
-        print(f"   ❌ Erro ao fazer upload para Supabase ({storage_path}): {e}")
+        print(f"   ❌ Erro upload ({storage_path}): {e}")
         return False
 
 
-def montar_nome_final_arquivo(
-    base_name: str,
-    empresa: str,
-    user: str,
-    codi: Optional[int],
-    mes_cod: str,
-    doc: str,
-) -> str:
-    doc_clean = somente_numeros(doc) or "sem-doc"
-    cod_str = str(codi) if codi is not None else "0"
-    email = user or "sem-user"
-    return f"{mes_cod}-{cod_str}-{doc_clean}-{email}-{base_name}"
-
-
 # =========================================================
-# SESSÃO mTLS
 # =========================================================
-def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
+# ============ 1) DF-e RO (SEFIN/RO) =======================
+# =========================================================
+# =========================================================
+
+ANTI_CAPTCHA_KEY = os.getenv("ANTI_CAPTCHA_KEY", "60ce5191cf427863d4f3c79ee20e4afe").strip()
+
+URL_BASE  = "https://download.dfe.sefin.ro.gov.br"
+URL_NOVO  = URL_BASE + "/solicitacoes/novo"
+URL_SOLICITACOES       = URL_BASE + "/solicitacoes"
+URL_DETALHES_TEMPLATE  = URL_BASE + "/solicitacoes/detalhes/{id}"
+URL_CREATE_BASE        = URL_BASE
+
+DFE_TYPES_MAP = {
+    "NFe": "0",
+    "CTe": "1",
+    "NFCe": "2",
+}
+
+TIPO_SOLICITACAO = "1"  # 1=PERIODO
+MAX_TENTATIVAS = 5
+DELAY_ENTRE_TENTATIVAS = 2
+
+def diagnostico_rede_anticaptcha():
+    host = "api.anti-captcha.com"
+    proxies = get_proxies()
+    print("\n[DIAG] Anti-Captcha: diagnóstico rápido...")
+    print(f"[DIAG] Usando proxies? {'SIM' if proxies else 'NÃO'}")
+    try:
+        ip = socket.gethostbyname(host)
+        print(f"[DIAG] DNS OK: {host} -> {ip}")
+    except Exception as e:
+        print(f"[DIAG] DNS FALHOU para {host}: {e}")
+        return
+    try:
+        r = requests.get(f"https://{host}", timeout=(15, 20), proxies=proxies)
+        print(f"[DIAG] GET https://{host} -> status {r.status_code}")
+    except Exception as e:
+        print(f"[DIAG] GET https://{host} falhou/timeout: {e}")
+
+def normalizar_tipo_documento(texto: str) -> Optional[str]:
+    if not texto:
+        return None
+    t = re.sub(r"\s+", " ", texto.strip().upper())
+    if "CTE" in t or "CT-E" in t or "CONHECIMENTO" in t:
+        return "CTe"
+    if "NFCE" in t or "NFC-E" in t or "CONSUMIDOR" in t:
+        return "NFCe"
+    if "NFE" in t or "NF-E" in t or "NOTA FISCAL" in t:
+        if "NFC" in t:
+            return "NFCe"
+        return "NFe"
+    return None
+
+def criar_sessao_dfe_ro(cert_path: str, key_path: str) -> requests.Session:
     s = requests.Session()
     s.cert = (cert_path, key_path)
-    print("✅ Certificado e chave carregados com sucesso.")
-
     s.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -316,14 +323,12 @@ def criar_sessao(cert_path: str, key_path: str) -> requests.Session:
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
+    print("✅ (DFE-RO) Certificado e chave carregados.")
     return s
 
-
-# =========================================================
-# ANTI-CAPTCHA (ROBUSTO PARA RENDER)
-# =========================================================
+# Anti-captcha session robusta
 _ANTI_SESSION = requests.Session()
-_retries = Retry(
+_anti_retries = Retry(
     total=5,
     connect=5,
     read=5,
@@ -332,17 +337,15 @@ _retries = Retry(
     allowed_methods=frozenset(["POST"]),
     raise_on_status=False,
 )
-_ANTI_SESSION.mount("https://", HTTPAdapter(max_retries=_retries))
-
+_ANTI_SESSION.mount("https://", HTTPAdapter(max_retries=_anti_retries))
 
 def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
     if not ANTI_CAPTCHA_KEY:
-        print("⚠️ ANTI_CAPTCHA_KEY vazia. Usando modo manual.")
+        print("⚠️ ANTI_CAPTCHA_KEY vazia. Sem captcha automático.")
         return None
 
     proxies = get_proxies()
-
-    print("🤖 Tentando Anti-Captcha API...")
+    print("🤖 (DFE-RO) Anti-Captcha...")
     start_time = time.time()
 
     create_payload: Dict[str, Any] = {
@@ -356,7 +359,6 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
         },
     }
 
-    # Render costuma precisar de timeouts maiores
     CONNECT_TIMEOUT = 45
     READ_TIMEOUT = 120
 
@@ -369,13 +371,12 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
         )
         r.raise_for_status()
         resp = r.json()
-
         task_id = resp.get("taskId")
         if not task_id:
             print("❌ Anti-Captcha createTask sem taskId:", resp)
             return None
 
-        max_polls = 14  # ~ 14*3s = 42s
+        max_polls = 14
         for i in range(max_polls):
             time.sleep(3)
             try:
@@ -388,30 +389,30 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
                 r2.raise_for_status()
                 result = r2.json()
             except requests.exceptions.RequestException as e:
-                print(f"⚠️ Falha no polling Anti-Captcha ({i+1}/{max_polls}): {e}")
+                print(f"⚠️ Poll Anti-Captcha ({i+1}/{max_polls}) falhou: {e}")
                 continue
 
             status = result.get("status")
             if status == "ready":
                 text = (result.get("solution") or {}).get("text")
                 if text:
-                    print(f"✅ Anti-Captcha resolveu em {time.time() - start_time:.1f}s: {text}")
+                    print(f"✅ Anti-Captcha OK em {time.time() - start_time:.1f}s: {text}")
                     return text
-                print("❌ Anti-Captcha 'ready' mas sem texto:", result)
+                print("❌ Anti-Captcha 'ready' sem texto:", result)
                 return None
 
             if status not in ("processing", None):
-                print("❌ Anti-Captcha retornou erro:", result)
+                print("❌ Anti-Captcha erro:", result)
                 return None
 
-        print("❌ Anti-Captcha não resolveu a tempo (timeout de polling).")
+        print("❌ Anti-Captcha timeout (polling).")
         return None
 
     except requests.exceptions.ConnectTimeout:
-        print("❌ Anti-Captcha: timeout de CONEXÃO (Render/rota/bloqueio). Indo para modo manual.")
+        print("❌ Anti-Captcha: timeout de CONEXÃO.")
         return None
     except requests.exceptions.ReadTimeout:
-        print("❌ Anti-Captcha: timeout de RESPOSTA (servidor lento). Indo para modo manual.")
+        print("❌ Anti-Captcha: timeout de RESPOSTA.")
         return None
     except requests.exceptions.RequestException as e:
         print("❌ Anti-Captcha: erro HTTP/rede:", e)
@@ -420,10 +421,6 @@ def resolver_captcha_anticaptcha(b64_image_content: str) -> Optional[str]:
         print("❌ Anti-Captcha: erro inesperado:", e)
         return None
 
-
-# =========================================================
-# CRIAR SOLICITAÇÕES (MÊS ANTERIOR)
-# =========================================================
 def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -441,52 +438,42 @@ def extrair_tokens_e_captcha(html: str) -> Tuple[str, str, str, str, bytes, str]
     action_url_relative = form.get("action") if form and form.get("action") else None
     if not action_url_relative:
         raise Exception("ERRO: O atributo 'action' do formulário está vazio.")
-
     URL_CREATE = URL_CREATE_BASE + action_url_relative
 
     img = soup.find("img", src=re.compile(r"^data:image/png;base64"))
     if not img:
         raise Exception("ERRO: Imagem do CAPTCHA não encontrada.")
-
     b64 = img["src"].split(",")[1]
     img_bytes = base64.b64decode(b64)
 
-    print(f"   ✅ Tokens extraídos. CNPJ: {cnpj_limpo}")
     if not csrf_token or not token_captcha or not cnpj_limpo:
         raise Exception("Erro na extração dos tokens de segurança (CSRF, Token, CNPJ).")
 
+    print(f"   ✅ Tokens extraídos. CNPJ: {cnpj_limpo}")
     return csrf_token, token_captcha, cnpj_limpo, URL_CREATE, img_bytes, b64
-
 
 def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: str) -> bool:
     print("\n========================================================")
-    print(f"🚀 INICIANDO SOLICITAÇÃO: {dfe_name} (Tipo: {dfe_type_code})")
+    print(f"🚀 (DFE-RO) SOLICITAÇÃO: {dfe_name} (Tipo: {dfe_type_code})")
     print("========================================================")
 
-    print("👉 1. Acessando NOVA SOLICITAÇÃO para obter tokens e CAPTCHA...")
-    start_total_time = time.time()
     r_novo = s.get(URL_NOVO, timeout=30, allow_redirects=True)
-
     if r_novo.status_code != 200:
-        print(f"   ERRO: Status {r_novo.status_code}. Não foi possível carregar a página.")
+        print(f"   ERRO: Status {r_novo.status_code} ao abrir /novo")
         return False
 
     try:
         csrf_token, token_captcha, cnpj_limpo, URL_CREATE, _img_bytes, b64_captcha = extrair_tokens_e_captcha(r_novo.text)
     except Exception as e:
-        print(f"❌ Erro na extração dos dados: {e}")
+        print(f"❌ Erro extraindo tokens/captcha: {e}")
         return False
 
     captcha_resposta: Optional[str] = resolver_captcha_anticaptcha(b64_captcha)
     if not captcha_resposta:
-        print("\n====================================================================")
-        print("🛑 MODO MANUAL: Resolução automática falhou ou indisponível no Render.")
-        print("====================================================================")
-        # No Render não tem input() prático; então aborta com False.
-        print("❌ Sem captcha automático e sem entrada manual. Abortando esta solicitação.")
+        print("❌ Sem captcha automático. Abortando solicitação.")
         return False
 
-    data_ini, data_fim = mes_anterior()
+    data_ini, data_fim = mes_anterior_str_range()
 
     payload: Dict[str, str] = {
         "authenticity_token": csrf_token,
@@ -502,66 +489,54 @@ def enviar_solicitacao_unica(s: requests.Session, dfe_name: str, dfe_type_code: 
         "dfes": "",
     }
 
-    print(f"\n   Payload pronto. Tipo: {dfe_name} | Período: {data_ini} a {data_fim}")
-
     headers: Dict[str, str] = {
         "Referer": URL_NOVO,
         "X-CSRF-Token": csrf_token,
         "X-Requested-With": "XMLHttpRequest",
     }
 
-    print("\n👉 2. Enviando solicitação POST...")
-    print(f"⏱️ TEMPO TOTAL GASTO ANTES DO POST: {(time.time() - start_total_time):.2f} segundos.")
-
     r_post = s.post(URL_CREATE, data=payload, headers=headers, timeout=60, allow_redirects=False)
-    print(f"   Status FINAL do POST: {r_post.status_code}")
+    print(f"   POST status: {r_post.status_code}")
 
     if r_post.status_code == 302:
-        print("🎉 SUCESSO COMPLETO (302 REDIRECIONAMENTO).")
+        print("🎉 SUCESSO (302).")
         return True
 
     if r_post.status_code == 200:
         response_text = r_post.text.strip()
-        print(f"   Resposta do Servidor (200): {response_text}")
         if response_text == '{"status":"Texto de verificação inválido"}':
-            print(f"❌ ERRO CRÍTICO: 'Texto de verificação inválido' ({dfe_name}).")
+            print(f"❌ CAPTCHA inválido ({dfe_name}).")
             return False
         if '"status":"ok"' in response_text or '"status":"success"' in response_text:
-            print(f"✅ SUCESSO: Solicitação de {dfe_name} aceita.")
+            print(f"✅ Solicitação {dfe_name} aceita.")
             return True
-        print(f"🛑 ERRO DE VALIDAÇÃO (200): verificar conteúdo para {dfe_name}.")
+        print(f"🛑 Resposta 200 inesperada: {response_text[:300]}")
         return False
 
-    print(f"🛑 ERRO INESPERADO: Status {r_post.status_code} em {dfe_name}.")
+    print(f"🛑 Status inesperado: {r_post.status_code}")
     return False
-
 
 def enviar_solicitacao_sequencial(s: requests.Session, apenas_tipos: Optional[List[str]] = None):
     tipos = list(DFE_TYPES_MAP.items()) if apenas_tipos is None else [(t, DFE_TYPES_MAP[t]) for t in apenas_tipos if t in DFE_TYPES_MAP]
-
-    print("\n=== INICIANDO ABERTURA DE NOVAS SOLICITAÇÕES (MÊS ANTERIOR) ===")
+    print("\n=== (DFE-RO) ABRINDO SOLICITAÇÕES (MÊS ANTERIOR) ===")
     for dfe_name, dfe_type_code in tipos:
         tentativas = 0
         success = False
         while tentativas < MAX_TENTATIVAS and not success:
             if tentativas > 0:
-                print(f"\n--- TENTATIVA {tentativas + 1} de {MAX_TENTATIVAS} para {dfe_name} ---")
+                print(f"\n--- Tentativa {tentativas + 1}/{MAX_TENTATIVAS} ({dfe_name}) ---")
                 time.sleep(DELAY_ENTRE_TENTATIVAS)
             success = enviar_solicitacao_unica(s, dfe_name, dfe_type_code)
             tentativas += 1
 
         if not success:
-            print(f"\n[SEQUÊNCIA] {dfe_name} falhou após {MAX_TENTATIVAS} tentativas.")
+            print(f"[DFE-RO] {dfe_name} falhou após {MAX_TENTATIVAS} tentativas.")
         else:
-            print(f"\n[SUCESSO] {dfe_name} solicitado.")
+            print(f"[DFE-RO] {dfe_name} solicitado.")
             time.sleep(DELAY_ENTRE_TENTATIVAS)
 
-
-# =========================================================
-# LISTAR SOLICITAÇÕES
-# =========================================================
 def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
-    print("🔎 Acessando lista de solicitações...")
+    print("🔎 (DFE-RO) Listando solicitações...")
     r = s.get(URL_SOLICITACOES, timeout=30)
     if r.status_code != 200:
         print("❌ Erro ao acessar /solicitacoes:", r.status_code)
@@ -612,13 +587,9 @@ def listar_solicitacoes(s: requests.Session) -> List[Dict[str, str]]:
                 "file_name": f"{tipo_documento}_{solicitacao_id}.zip".replace(" ", "_").replace("/", "-"),
             })
 
-    print(f"   ✔ {len(itens)} solicitações encontradas na tabela.")
+    print(f"   ✔ {len(itens)} itens na tabela.")
     return itens
 
-
-# =========================================================
-# DETALHES: PERÍODO + DOC (quando existir)
-# =========================================================
 def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Dict[str, Optional[str]]:
     url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
     r = s.get(url, timeout=30)
@@ -632,27 +603,20 @@ def extrair_detalhes_solicitacao(s: requests.Session, solicitacao_id: str) -> Di
 
     periodo = None
     doc = None
-
     for tr in tabela.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 2:
             continue
-
         k = tds[0].get_text(strip=True).upper()
         v = tds[1].get_text(strip=True)
 
         if "PERÍODO" in k:
             periodo = v
-
         if ("CNPJ" in k) or ("CPF" in k):
             doc = somente_numeros(v) or doc
 
     return {"periodo": periodo, "doc": doc}
 
-
-# =========================================================
-# SELEÇÃO: 1 SOLICITAÇÃO POR TIPO (TIPO + PERÍODO)
-# =========================================================
 def _parse_id_num(solicitacao_id: str) -> int:
     try:
         return int(re.sub(r"\D+", "", solicitacao_id or "") or "0")
@@ -693,10 +657,6 @@ def selecionar_uma_por_tipo(solicitacoes_filtradas: List[Dict[str, Any]]) -> Dic
         melhor[k].pop("_score", None)
     return melhor
 
-
-# =========================================================
-# DOWNLOAD (CAPTCHA POPUP)
-# =========================================================
 def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tuple[str, str]]:
     detalhes_url = URL_DETALHES_TEMPLATE.format(id=solicitacao_id)
     r = s.get(detalhes_url, timeout=30)
@@ -707,12 +667,12 @@ def obter_url_captcha(s: requests.Session, solicitacao_id: str) -> Optional[Tupl
     soup = BeautifulSoup(r.text, "lxml")
     link = soup.find("a", class_=re.compile(r"\blink-detalhe\b"), href=re.compile(r"get_captcha_download"))
     if not link or not link.has_attr("href"):
-        print("❌ Não achei o link do ARQUIVO (get_captcha_download) na página de Detalhes.")
+        print("❌ Não achei o link do download (get_captcha_download) na página de Detalhes.")
         return None
 
     href = link["href"]
     captcha_url = URL_BASE + href if not href.startswith("http") else href
-    print(f"   ✅ URL do pop-up (get_captcha_download): {captcha_url}")
+    print(f"   ✅ URL get_captcha_download: {captcha_url}")
     return captcha_url, detalhes_url
 
 def extrair_html_modal(js: str) -> Optional[str]:
@@ -725,16 +685,13 @@ def extrair_html_modal(js: str) -> Optional[str]:
                .replace('\\"', '"')
                .replace("\\/", "/")
         )
-
     if "<form" in js and "captcha_resposta" in js:
         return js
-
-    print("❌ HTML do modal não encontrado.")
     return None
 
 def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any], storage_path: str) -> bool:
     solicitacao_id = solicitacao_data["id"]
-    print("\n⬇️ Iniciando download do ID", solicitacao_id)
+    print("\n⬇️ (DFE-RO) Baixando ID", solicitacao_id)
 
     res = obter_url_captcha(s, solicitacao_id)
     if not res:
@@ -747,11 +704,12 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any],
         timeout=30,
     )
     if r_get.status_code != 200:
-        print("❌ Erro HTTP ao buscar get_captcha_download:", r_get.status_code)
+        print("❌ Erro HTTP no get_captcha_download:", r_get.status_code)
         return False
 
     html_modal = extrair_html_modal(r_get.text)
     if not html_modal:
+        print("❌ Não consegui extrair HTML do modal.")
         return False
 
     soup = BeautifulSoup(html_modal, "lxml")
@@ -760,7 +718,7 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any],
     img_tag = form.find("img") if form else None
 
     if not form or not token_input or not img_tag or not img_tag.get("src", "").startswith("data:image"):
-        print("❌ Elementos críticos (Formulário, Token ou Imagem CAPTCHA) não encontrados no modal.")
+        print("❌ Modal sem form/token/img.")
         return False
 
     action = form.get("action")
@@ -772,10 +730,9 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any],
 
     captcha = resolver_captcha_anticaptcha(b64)
     if not captcha:
-        print("❌ Sem captcha automático no Render. Abortando download deste ID.")
+        print("❌ Sem captcha automático. Abortando download.")
         return False
 
-    print("3️⃣ Enviando GET final para baixar o ZIP...")
     params = {"token": token, "captcha_resposta": captcha}
     r_final = s.get(action, params=params, stream=True, timeout=120)
 
@@ -787,11 +744,7 @@ def realizar_download_dfe(s: requests.Session, solicitacao_data: Dict[str, Any],
     print("❌ Falha no GET final. Content-Type:", content_type, "| Status:", r_final.status_code)
     return False
 
-
-# =========================================================
-# FLUXO POR EMPRESA
-# =========================================================
-def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
+def fluxo_dfe_ro_para_empresa(cert_row: Dict[str, Any]):
     empresa = cert_row.get("empresa") or ""
     user = cert_row.get("user") or ""
     codi = cert_row.get("codi")
@@ -800,70 +753,357 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
     doc_alvo = somente_numeros(doc_raw) or ""
 
     print("\n\n========================================================")
-    print(f"🏢 Iniciando fluxo para empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
+    print(f"🏢 (DFE-RO) empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
     print("========================================================")
 
+    cert_path = key_path = tmp_dir = None
     try:
-        cert_path, key_path = criar_arquivos_cert_temp(cert_row)
-        s = criar_sessao(cert_path, key_path)
+        cert_path, key_path, tmp_dir = criar_arquivos_cert_temp(cert_row)
+        s = criar_sessao_dfe_ro(cert_path, key_path)
     except Exception as e:
-        print("❌ Erro ao criar sessão com certificado:", e)
+        print("❌ (DFE-RO) Erro criando sessão:", e)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         return
 
-    print("--- INICIANDO VERIFICAÇÃO / SOLICITAÇÕES / DOWNLOADS ---")
-    solicitacoes = listar_solicitacoes(s)
+    try:
+        solicitacoes = listar_solicitacoes(s)
+        periodo_alvo = periodo_mes_anterior_str()
+        mes_cod = mes_anterior_codigo()
 
-    periodo_alvo = periodo_mes_anterior_str()
-    mes_cod = mes_anterior_codigo()
+        filtradas: List[Dict[str, Any]] = []
+        for item in solicitacoes:
+            solicitacao_id = item["id"]
+            estado = (item.get("estado") or "").upper()
 
-    filtradas: List[Dict[str, Any]] = []
-    for item in solicitacoes:
-        solicitacao_id = item["id"]
-        estado = (item.get("estado") or "").upper()
+            tipo_norm = normalizar_tipo_documento(item.get("documento", ""))
+            if not tipo_norm or tipo_norm not in DFE_TYPES_MAP:
+                continue
 
-        tipo_norm = normalizar_tipo_documento(item.get("documento", ""))
-        if not tipo_norm or tipo_norm not in DFE_TYPES_MAP:
+            det = extrair_detalhes_solicitacao(s, solicitacao_id)
+            periodo = (det.get("periodo") or "").strip()
+            doc_det = somente_numeros(det.get("doc")) if det.get("doc") else ""
+
+            if not periodo or periodo != periodo_alvo:
+                continue
+            if doc_alvo and doc_det and doc_det != doc_alvo:
+                continue
+
+            filtradas.append({
+                **item,
+                "tipo_norm": tipo_norm,
+                "periodo": periodo,
+                "doc_det": doc_det,
+                "estado": estado,
+            })
+
+        escolhidas = selecionar_uma_por_tipo(filtradas)
+
+        if not escolhidas:
+            print("⚠️ (DFE-RO) Nenhuma solicitação do mês anterior encontrada.")
+        else:
+            for tipo, it in escolhidas.items():
+                print(f"⭐ (DFE-RO) {tipo}: ID {it['id']} | estado: {it['estado']} | período: {it['periodo']}")
+
+        # baixar somente quando DOWNLOAD
+        for tipo in ["CTe", "NFCe", "NFe"]:
+            it = escolhidas.get(tipo)
+            if not it:
+                continue
+            if it["estado"] != "DOWNLOAD":
+                print(f"   🔄 (DFE-RO) {tipo}: ID {it['id']} está '{it['estado']}'. Não baixa agora.")
+                continue
+
+            base_name = it["file_name"]
+            nome_final = montar_nome_final_arquivo(
+                base_name=base_name,
+                user=user,
+                codi=codi,
+                mes_cod=mes_cod,
+                doc=doc_alvo or doc_raw,
+            )
+            storage_path = f"{PASTA_NOTAS}/{nome_final}"
+
+            if arquivo_ja_existe_no_storage(storage_path):
+                print(f"   ⤵ (DFE-RO) {tipo}: já existe no storage: {storage_path}")
+                continue
+
+            ok = False
+            tent = 0
+            while tent < 3 and not ok:
+                ok = realizar_download_dfe(s, it, storage_path)
+                tent += 1
+                if not ok:
+                    print(f"   (DFE-RO) {tipo}: tentativa {tent} falhou (ID {it['id']}).")
+                    time.sleep(10)
+
+            if ok:
+                print(f"   ✅ (DFE-RO) {tipo}: download OK.")
+            else:
+                print(f"❌ (DFE-RO) {tipo}: falhou após 3 tentativas.")
+
+        # se faltou algum tipo, abre solicitação só do que falta
+        faltando = [t for t in DFE_TYPES_MAP.keys() if t not in escolhidas]
+        if not faltando:
+            print("✅ (DFE-RO) Já existe solicitação do mês anterior para todos os tipos.")
+        else:
+            print("⚠️ (DFE-RO) Faltam tipos:", ", ".join(faltando))
+            print("➡️ (DFE-RO) Abrindo novas solicitações SOMENTE dos tipos faltantes...")
+            enviar_solicitacao_sequencial(s, apenas_tipos=faltando)
+
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =========================================================
+# =========================================================
+# ============ 2) NFS-e ADN ================================
+# =========================================================
+# =========================================================
+ADN_BASE = "https://adn.nfse.gov.br"
+
+def diagnostico_rede_adn():
+    host = "adn.nfse.gov.br"
+    print("\n[DIAG] ADN: diagnóstico rápido...")
+    try:
+        ip = socket.gethostbyname(host)
+        print(f"[DIAG] DNS OK: {host} -> {ip}")
+    except Exception as e:
+        print(f"[DIAG] DNS FALHOU: {e}")
+        return
+    try:
+        r = requests.get(f"https://{host}", timeout=(10, 20))
+        print(f"[DIAG] GET https://{host} -> {r.status_code}")
+    except Exception as e:
+        print(f"[DIAG] GET https://{host} falhou: {e}")
+
+def decode_xml_field(value: str) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    if value.lstrip().startswith("<"):
+        return value
+    try:
+        b = base64.b64decode(value, validate=False)
+    except Exception:
+        return None
+    try:
+        return gzip.decompress(b).decode("utf-8", errors="replace")
+    except Exception:
+        try:
+            return b.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+def find_xmls(data: Any) -> List[str]:
+    xmls: List[str] = []
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, str):
+                xml = decode_xml_field(v)
+                if xml and xml.strip().startswith("<"):
+                    xmls.append(xml)
+            else:
+                xmls.extend(find_xmls(v))
+    elif isinstance(data, list):
+        for item in data:
+            xmls.extend(find_xmls(item))
+    return xmls
+
+def parse_possible_date(texto: str) -> Optional[datetime]:
+    if not texto:
+        return None
+    t = texto.strip()
+
+    if len(t) >= 10 and t[4:5] == "-" and t[7:8] == "-":
+        try:
+            return datetime.strptime(t[:10], "%Y-%m-%d")
+        except Exception:
+            pass
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(t, fmt)
+        except Exception:
+            pass
+
+    return None
+
+def xml_in_period(xml_str: str, data_ini: datetime, data_fim: datetime) -> bool:
+    try:
+        root = etree.fromstring(xml_str.encode("utf-8", errors="ignore"))
+        nodes = root.xpath(
+            "//*[contains(translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'data') "
+            "or contains(translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'compet')]"
+        )
+        for n in nodes:
+            dt = parse_possible_date((n.text or "").strip())
+            if dt and data_ini <= dt <= data_fim:
+                return True
+    except Exception:
+        pass
+    return False
+
+def criar_sessao_adn(cert_path: str, key_path: str) -> requests.Session:
+    s = requests.Session()
+    s.cert = (cert_path, key_path)
+    s.verify = True
+    s.headers.update({
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    })
+
+    retries = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
+
+def zipar_pasta_em_memoria(pasta_local: str) -> bytes:
+    buf = tempfile.SpooledTemporaryFile(max_size=50 * 1024 * 1024)
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(pasta_local):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, pasta_local).replace("\\", "/")
+                z.write(full, rel)
+    buf.seek(0)
+    return buf.read()
+
+def baixar_nfse_mes_anterior_para_pasta(
+    s: requests.Session,
+    cnpj: str,
+    pasta_saida: str,
+    start_nsu: int,
+    max_nsu: int,
+) -> Tuple[int, int]:
+    data_ini, data_fim = mes_anterior_range_dt()
+
+    nsu = int(start_nsu)
+    limite = int(start_nsu) + int(max_nsu)
+
+    total_salvos = 0
+    total_nsu_proc = 0
+
+    while nsu < limite:
+        url = f"{ADN_BASE}/contribuintes/DFe/{nsu}?cnpjConsulta={cnpj}"
+
+        try:
+            r = s.get(url, timeout=60)
+        except Exception as e:
+            print(f"[ADN NSU {nsu}] ERRO REDE: {e}")
+            nsu += 1
             continue
 
-        det = extrair_detalhes_solicitacao(s, solicitacao_id)
-        periodo = (det.get("periodo") or "").strip()
-        doc_det = somente_numeros(det.get("doc")) if det.get("doc") else ""
+        if r.status_code == 204:
+            print(f"[ADN NSU {nsu}] Sem conteúdo (204). Encerrando.")
+            break
 
-        if not periodo or periodo != periodo_alvo:
+        ctype = (r.headers.get("Content-Type") or "").lower()
+
+        if r.status_code >= 400:
+            print(f"[ADN NSU {nsu}] HTTP {r.status_code} | CT={ctype} | Corpo: {str(r.text)[:200]}")
+            nsu += 1
             continue
 
-        if doc_alvo and doc_det and doc_det != doc_alvo:
+        if "application/json" not in ctype:
+            print(f"[ADN NSU {nsu}] Não-JSON. CT={ctype} | Corpo: {str(r.text)[:200]}")
+            nsu += 1
             continue
 
-        filtradas.append({
-            **item,
-            "tipo_norm": tipo_norm,
-            "periodo": periodo,
-            "doc_det": doc_det,
-            "estado": estado,
-        })
-
-    escolhidas = selecionar_uma_por_tipo(filtradas)
-
-    if not escolhidas:
-        print("⚠️ Nenhuma solicitação encontrada para o período alvo (mês anterior).")
-    else:
-        for tipo, it in escolhidas.items():
-            print(f"⭐ Escolhida para {tipo}: ID {it['id']} | estado: {it['estado']} | período: {it['periodo']} | doc(det): {it.get('doc_det') or 'N/D'}")
-
-    for tipo in ["CTe", "NFCe", "NFe"]:
-        it = escolhidas.get(tipo)
-        if not it:
+        try:
+            data = r.json()
+        except Exception as e:
+            print(f"[ADN NSU {nsu}] JSON inválido ({e}).")
+            nsu += 1
             continue
 
-        if it["estado"] != "DOWNLOAD":
-            print(f"   🔄 {tipo}: escolhida ID {it['id']} ainda está em '{it['estado']}'. Não baixa agora.")
-            continue
+        total_nsu_proc += 1
 
-        base_name = it["file_name"]
+        # salva bruto
+        raw_fn = os.path.join(pasta_saida, f"nsu_{nsu}_raw.json")
+        try:
+            with open(raw_fn, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[ADN NSU {nsu}] Falha ao salvar JSON bruto: {e}")
+
+        xmls = find_xmls(data)
+        salvos_nsu = 0
+
+        for i, xml in enumerate(xmls, start=1):
+            if xml_in_period(xml, data_ini, data_fim):
+                total_salvos += 1
+                salvos_nsu += 1
+                nome = f"NFS-e_{nsu}_{i}_{total_salvos}.xml"
+                xml_path = os.path.join(pasta_saida, nome)
+                try:
+                    with open(xml_path, "w", encoding="utf-8") as f:
+                        f.write(xml)
+                except Exception as e:
+                    print(f"[ADN NSU {nsu}] Erro salvando XML {nome}: {e}")
+
+        print(f"[ADN NSU {nsu}] OK - XMLs: {len(xmls)} | salvos no período: {salvos_nsu}")
+        nsu += 1
+
+    return total_salvos, total_nsu_proc
+
+def fluxo_nfse_para_empresa(cert_row: Dict[str, Any]):
+    empresa = cert_row.get("empresa") or ""
+    user = cert_row.get("user") or ""
+    codi = cert_row.get("codi")
+    venc = cert_row.get("vencimento")
+    doc_raw = cert_row.get("cnpj/cpf") or ""
+    doc_alvo = somente_numeros(doc_raw) or ""
+
+    print("\n\n========================================================")
+    print(f"🏢 (NFS-e ADN) empresa: {empresa} | user: {user} | codi: {codi} | doc: {doc_raw} | venc: {venc}")
+    print("========================================================")
+
+    if not doc_alvo or len(doc_alvo) < 11:
+        print("⏭️ (NFS-e) Pulando: doc inválido/ausente.")
+        return
+
+    cert_path = key_path = tmp_dir = None
+    work_dir = None
+    try:
+        cert_path, key_path, tmp_dir = criar_arquivos_cert_temp(cert_row)
+        s = criar_sessao_adn(cert_path, key_path)
+
+        work_dir = tempfile.mkdtemp(prefix="nfse_adn_")
+        print(f"   📁 (NFS-e) Pasta temp: {work_dir}")
+
+        total_xml, total_nsu = baixar_nfse_mes_anterior_para_pasta(
+            s=s,
+            cnpj=doc_alvo,
+            pasta_saida=work_dir,
+            start_nsu=START_NSU_DEFAULT,
+            max_nsu=MAX_NSU_DEFAULT,
+        )
+
+        if total_nsu == 0:
+            print("⚠️ (NFS-e) Nada processado no ADN.")
+            return
+
+        tem_arquivos = any(files for _root, _dirs, files in os.walk(work_dir))
+        if not tem_arquivos:
+            print("⚠️ (NFS-e) Pasta vazia. Não envia ZIP.")
+            return
+
+        mes_cod = mes_anterior_codigo()
+        base_name = f"NFSE_{mes_cod}.zip"
         nome_final = montar_nome_final_arquivo(
             base_name=base_name,
-            empresa=empresa,
             user=user,
             codi=codi,
             mes_cod=mes_cod,
@@ -872,40 +1112,34 @@ def fluxo_completo_para_empresa(cert_row: Dict[str, Any]):
         storage_path = f"{PASTA_NOTAS}/{nome_final}"
 
         if arquivo_ja_existe_no_storage(storage_path):
-            print(f"   ⤵ {tipo}: já existe no Supabase, não baixa: {storage_path}")
-            continue
+            print(f"⤵ (NFS-e) Já existe no storage. Não reenvia: {storage_path}")
+            return
 
-        ok = False
-        tent = 0
-        while tent < 3 and not ok:
-            ok = realizar_download_dfe(s, it, storage_path)
-            tent += 1
-            if not ok:
-                print(f"   {tipo}: Tentativa {tent} falhou para ID {it['id']}.")
-                time.sleep(10)
+        zip_bytes = zipar_pasta_em_memoria(work_dir)
+        print(f"   📦 (NFS-e) ZIP pronto ({len(zip_bytes)/1024:.1f} KB) | XMLs período: {total_xml} | NSUs: {total_nsu}")
 
+        ok = upload_para_storage(storage_path, zip_bytes, content_type="application/zip")
         if ok:
-            print(f"   ✅ {tipo}: Download concluído (ID {it['id']}).")
+            print(f"✅ (NFS-e) Enviado: {storage_path}")
         else:
-            print(f"❌ {tipo}: Falha crítica ao baixar ID {it['id']} depois de 3 tentativas.")
+            print(f"❌ (NFS-e) Falhou upload: {storage_path}")
 
-    faltando = [t for t in DFE_TYPES_MAP.keys() if t not in escolhidas]
-    if not faltando:
-        print("\n✅ Já existe solicitação do MÊS ANTERIOR para TODOS os tipos (considerando TIPO+PERÍODO).")
-        print("   ❌ Não será aberta nova solicitação agora (evita duplicar pedidos).")
-    else:
-        print("\n⚠️ Faltam solicitaitações do mês anterior nos tipos:", ", ".join(faltando))
-        print("➡️ Abrindo novas solicitações SOMENTE para os tipos faltantes...")
-        enviar_solicitacao_sequencial(s, apenas_tipos=faltando)
+    except Exception as e:
+        print(f"❌ (NFS-e) Erro inesperado: {e}")
+    finally:
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # =========================================================
-# MAIN
+# LOOP ÚNICO: PROCESSA AMBOS POR EMPRESA
 # =========================================================
 def processar_todas_empresas():
     certs = carregar_certificados_validos()
     if not certs:
-        print("⚠️ Nenhum certificado encontrado na tabela certifica_dfe.")
+        print("⚠️ Nenhum certificado encontrado.")
         return
 
     hoje = hoje_ro()
@@ -924,15 +1158,37 @@ def processar_todas_empresas():
             print(f"\n⏭️ PULANDO (CERT VENCIDO): {empresa} | user: {user} | venc: {venc} | hoje: {hoje.isoformat()}")
             continue
 
-        try:
-            fluxo_completo_para_empresa(cert_row)
-        except Exception as e:
-            print(f"❌ Erro inesperado ao processar empresa {empresa}: {e}")
+        # roda DF-e RO
+        if RUN_DFE:
+            try:
+                fluxo_dfe_ro_para_empresa(cert_row)
+            except Exception as e:
+                print(f"💥 (DFE-RO) Erro inesperado em {empresa}: {e}")
+
+        # roda NFS-e ADN
+        if RUN_NFSE:
+            try:
+                fluxo_nfse_para_empresa(cert_row)
+            except Exception as e:
+                print(f"💥 (NFS-e) Erro inesperado em {empresa}: {e}")
 
 
+# =========================================================
+# MAIN
+# =========================================================
 if __name__ == "__main__":
-    # diagnóstico só uma vez ao iniciar (pra você ver no log do Render)
-    diagnostico_rede_anticaptcha()
+    print("========================================================")
+    print("ROBÔ ÚNICO: DFE-RO + NFS-e ADN")
+    print(f"RUN_DFE={int(RUN_DFE)} | RUN_NFSE={int(RUN_NFSE)}")
+    print(f"Fuso: {FUSO_RO} | Hoje: {hoje_ro().strftime('%d/%m/%Y')}")
+    print(f"Loop a cada {INTERVALO_LOOP_SEGUNDOS}s")
+    print("========================================================")
+
+    # diagnósticos
+    if RUN_DFE:
+        diagnostico_rede_anticaptcha()
+    if RUN_NFSE:
+        diagnostico_rede_adn()
 
     while True:
         print("\n\n==================== NOVA VARREDURA GERAL ====================")
@@ -941,5 +1197,6 @@ if __name__ == "__main__":
             processar_todas_empresas()
         except Exception as e:
             print(f"💥 Erro inesperado no loop principal: {e}")
-        print(f"🕒 Aguardando {INTERVALO_LOOP_SEGUNDOS} segundos para próxima varredura...\n")
+
+        print(f"🕒 Aguardando {INTERVALO_LOOP_SEGUNDOS} segundos...\n")
         time.sleep(INTERVALO_LOOP_SEGUNDOS)
